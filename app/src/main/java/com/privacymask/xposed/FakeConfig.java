@@ -2,9 +2,8 @@ package com.privacymask.xposed;
 
 import android.content.SharedPreferences;
 
-import java.util.Arrays;
-import java.util.HashSet;
-import java.util.Set;
+import java.util.HashMap;
+import java.util.Map;
 
 import io.github.libxposed.api.XposedInterface;
 
@@ -27,8 +26,12 @@ public class FakeConfig {
     public final String localeLang, localeCountry;
     public final String phoneNumber;
     public final double latitude, longitude;
-    public final Set<String> scope; // empty = every app the framework scoped this module to
     public final int version;
+
+    // One flag per individual hook — see HookCatalog for the full grouped list of keys. All
+    // default to true, so a fresh install (or one upgrading from the old six group-level
+    // switches) behaves exactly like before this option existed.
+    private final Map<String, Boolean> hookEnabled = new HashMap<>();
 
     private FakeConfig(SharedPreferences sp) {
         isoCountry = sp.getString(ConfigKeys.COUNTRY, "de");
@@ -44,16 +47,15 @@ public class FakeConfig {
         longitude = sp.getFloat(ConfigKeys.LNG, 13.4f);
         version = sp.getInt(ConfigKeys.VERSION, 0);
 
-        String rawScope = sp.getString(ConfigKeys.SCOPE, "");
-        scope = new HashSet<>();
-        if (rawScope != null && !rawScope.trim().isEmpty()) {
-            scope.addAll(Arrays.asList(rawScope.split(",")));
+        for (HookCatalog.Hook hook : HookCatalog.allHooks()) {
+            hookEnabled.put(hook.key, sp.getBoolean(hook.key, true));
         }
     }
 
-    public boolean appliesTo(String packageName) {
-        if (scope.isEmpty()) return true;
-        return scope.contains(packageName.trim());
+    /** Whether the individual hook identified by one of the ConfigKeys.HOOK_* keys is on. */
+    public boolean isHookEnabled(String key) {
+        Boolean v = hookEnabled.get(key);
+        return v == null || v;
     }
 
     public String operatorNumeric() {

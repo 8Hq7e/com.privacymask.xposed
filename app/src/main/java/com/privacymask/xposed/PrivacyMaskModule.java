@@ -68,7 +68,6 @@ public class PrivacyMaskModule extends XposedModule {
 
         try {
             FakeConfig cfg = FakeConfig.from(this);
-            if (!cfg.appliesTo(packageName)) return;
             applyAllHooks(cfg);
             log(Log.INFO, TAG, "applied fake identity [" + cfg.isoCountry + "] to "
                     + packageName + " (config v" + cfg.version + ")");
@@ -78,6 +77,9 @@ public class PrivacyMaskModule extends XposedModule {
     }
 
     private void applyAllHooks(FakeConfig cfg) {
+        // Every hookXxx() method below now checks each individual hook's own switch (see
+        // ConfigKeys.HOOK_* / HookCatalog), so all six groups are always visited here; whether
+        // any given Android API actually gets intercepted depends entirely on that hook's flag.
         hookTelephony(cfg);
         hookSubscriptionInfo(cfg);
         hookLocation(cfg);
@@ -90,33 +92,54 @@ public class PrivacyMaskModule extends XposedModule {
     // TelephonyManager: SIM country, network country, carrier, phone number
     // -----------------------------------------------------------------
     private void hookTelephony(FakeConfig cfg) {
-        hookSafe(() -> hook(TelephonyManager.class.getDeclaredMethod("getSimCountryIso"))
-                .intercept(chain -> cfg.isoCountry));
-        hookSafe(() -> hook(TelephonyManager.class.getDeclaredMethod("getNetworkCountryIso"))
-                .intercept(chain -> cfg.isoCountry));
-        hookSafe(() -> hook(TelephonyManager.class.getDeclaredMethod("getSimOperator"))
-                .intercept(chain -> cfg.operatorNumeric()));
-        hookSafe(() -> hook(TelephonyManager.class.getDeclaredMethod("getNetworkOperator"))
-                .intercept(chain -> cfg.operatorNumeric()));
-        hookSafe(() -> hook(TelephonyManager.class.getDeclaredMethod("getSimOperatorName"))
-                .intercept(chain -> cfg.simOperatorName));
-        hookSafe(() -> hook(TelephonyManager.class.getDeclaredMethod("getNetworkOperatorName"))
-                .intercept(chain -> cfg.networkOperatorName));
-        hookSafe(() -> hook(TelephonyManager.class.getDeclaredMethod("getLine1Number"))
-                .intercept(chain -> cfg.phoneNumber));
+        // Per-slot overloads (getNetworkCountryIso(int slotIndex) etc., added API 30+) are
+        // multi-SIM-aware variants of the exact same getter, so they ride along with their
+        // no-arg counterpart's switch instead of getting their own.
+        boolean hasSlotOverloads = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R;
 
-        // Per-slot overloads (getNetworkCountryIso(int slotIndex) etc., added API 30+).
-        // Multi-SIM-aware apps call these directly instead of the no-arg version above, so
-        // both need to be covered or the slot-index call leaks the real value straight through.
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            hookSafe(() -> hook(TelephonyManager.class.getDeclaredMethod("getNetworkCountryIso", int.class))
+        if (cfg.isHookEnabled(ConfigKeys.HOOK_TEL_SIM_COUNTRY_ISO)) {
+            hookSafe(() -> hook(TelephonyManager.class.getDeclaredMethod("getSimCountryIso"))
                     .intercept(chain -> cfg.isoCountry));
-            hookSafe(() -> hook(TelephonyManager.class.getDeclaredMethod("getSimCountryIso", int.class))
+            if (hasSlotOverloads) {
+                hookSafe(() -> hook(TelephonyManager.class.getDeclaredMethod("getSimCountryIso", int.class))
+                        .intercept(chain -> cfg.isoCountry));
+            }
+        }
+        if (cfg.isHookEnabled(ConfigKeys.HOOK_TEL_NETWORK_COUNTRY_ISO)) {
+            hookSafe(() -> hook(TelephonyManager.class.getDeclaredMethod("getNetworkCountryIso"))
                     .intercept(chain -> cfg.isoCountry));
-            hookSafe(() -> hook(TelephonyManager.class.getDeclaredMethod("getSimOperator", int.class))
+            if (hasSlotOverloads) {
+                hookSafe(() -> hook(TelephonyManager.class.getDeclaredMethod("getNetworkCountryIso", int.class))
+                        .intercept(chain -> cfg.isoCountry));
+            }
+        }
+        if (cfg.isHookEnabled(ConfigKeys.HOOK_TEL_SIM_OPERATOR)) {
+            hookSafe(() -> hook(TelephonyManager.class.getDeclaredMethod("getSimOperator"))
                     .intercept(chain -> cfg.operatorNumeric()));
-            hookSafe(() -> hook(TelephonyManager.class.getDeclaredMethod("getSimOperatorName", int.class))
+            if (hasSlotOverloads) {
+                hookSafe(() -> hook(TelephonyManager.class.getDeclaredMethod("getSimOperator", int.class))
+                        .intercept(chain -> cfg.operatorNumeric()));
+            }
+        }
+        if (cfg.isHookEnabled(ConfigKeys.HOOK_TEL_NETWORK_OPERATOR)) {
+            hookSafe(() -> hook(TelephonyManager.class.getDeclaredMethod("getNetworkOperator"))
+                    .intercept(chain -> cfg.operatorNumeric()));
+        }
+        if (cfg.isHookEnabled(ConfigKeys.HOOK_TEL_SIM_OPERATOR_NAME)) {
+            hookSafe(() -> hook(TelephonyManager.class.getDeclaredMethod("getSimOperatorName"))
                     .intercept(chain -> cfg.simOperatorName));
+            if (hasSlotOverloads) {
+                hookSafe(() -> hook(TelephonyManager.class.getDeclaredMethod("getSimOperatorName", int.class))
+                        .intercept(chain -> cfg.simOperatorName));
+            }
+        }
+        if (cfg.isHookEnabled(ConfigKeys.HOOK_TEL_NETWORK_OPERATOR_NAME)) {
+            hookSafe(() -> hook(TelephonyManager.class.getDeclaredMethod("getNetworkOperatorName"))
+                    .intercept(chain -> cfg.networkOperatorName));
+        }
+        if (cfg.isHookEnabled(ConfigKeys.HOOK_TEL_PHONE_NUMBER)) {
+            hookSafe(() -> hook(TelephonyManager.class.getDeclaredMethod("getLine1Number"))
+                    .intercept(chain -> cfg.phoneNumber));
         }
     }
 
@@ -127,24 +150,41 @@ public class PrivacyMaskModule extends XposedModule {
     // covers every caller that walks that list regardless of how they obtained it.
     // -----------------------------------------------------------------
     private void hookSubscriptionInfo(FakeConfig cfg) {
-        hookSafe(() -> hook(SubscriptionInfo.class.getDeclaredMethod("getCountryIso"))
-                .intercept(chain -> cfg.isoCountry));
-        hookSafe(() -> hook(SubscriptionInfo.class.getDeclaredMethod("getCarrierName"))
-                .intercept(chain -> cfg.simOperatorName));
-        hookSafe(() -> hook(SubscriptionInfo.class.getDeclaredMethod("getDisplayName"))
-                .intercept(chain -> cfg.simOperatorName));
-        hookSafe(() -> hook(SubscriptionInfo.class.getDeclaredMethod("getNumber"))
-                .intercept(chain -> cfg.phoneNumber));
-        hookSafe(() -> hook(SubscriptionInfo.class.getDeclaredMethod("getMcc"))
-                .intercept(chain -> Integer.parseInt(cfg.mcc)));
-        hookSafe(() -> hook(SubscriptionInfo.class.getDeclaredMethod("getMnc"))
-                .intercept(chain -> Integer.parseInt(cfg.mnc)));
-        // String variants of MCC/MNC, added API 29 (Q).
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            hookSafe(() -> hook(SubscriptionInfo.class.getDeclaredMethod("getMccString"))
-                    .intercept(chain -> cfg.mcc));
-            hookSafe(() -> hook(SubscriptionInfo.class.getDeclaredMethod("getMncString"))
-                    .intercept(chain -> cfg.mnc));
+        boolean hasStringVariants = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q;
+
+        if (cfg.isHookEnabled(ConfigKeys.HOOK_SUB_COUNTRY_ISO)) {
+            hookSafe(() -> hook(SubscriptionInfo.class.getDeclaredMethod("getCountryIso"))
+                    .intercept(chain -> cfg.isoCountry));
+        }
+        if (cfg.isHookEnabled(ConfigKeys.HOOK_SUB_CARRIER_NAME)) {
+            hookSafe(() -> hook(SubscriptionInfo.class.getDeclaredMethod("getCarrierName"))
+                    .intercept(chain -> cfg.simOperatorName));
+        }
+        if (cfg.isHookEnabled(ConfigKeys.HOOK_SUB_DISPLAY_NAME)) {
+            hookSafe(() -> hook(SubscriptionInfo.class.getDeclaredMethod("getDisplayName"))
+                    .intercept(chain -> cfg.simOperatorName));
+        }
+        if (cfg.isHookEnabled(ConfigKeys.HOOK_SUB_NUMBER)) {
+            hookSafe(() -> hook(SubscriptionInfo.class.getDeclaredMethod("getNumber"))
+                    .intercept(chain -> cfg.phoneNumber));
+        }
+        if (cfg.isHookEnabled(ConfigKeys.HOOK_SUB_MCC)) {
+            hookSafe(() -> hook(SubscriptionInfo.class.getDeclaredMethod("getMcc"))
+                    .intercept(chain -> Integer.parseInt(cfg.mcc)));
+            // String variant of MCC, added API 29 (Q) — same switch as the int getter above.
+            if (hasStringVariants) {
+                hookSafe(() -> hook(SubscriptionInfo.class.getDeclaredMethod("getMccString"))
+                        .intercept(chain -> cfg.mcc));
+            }
+        }
+        if (cfg.isHookEnabled(ConfigKeys.HOOK_SUB_MNC)) {
+            hookSafe(() -> hook(SubscriptionInfo.class.getDeclaredMethod("getMnc"))
+                    .intercept(chain -> Integer.parseInt(cfg.mnc)));
+            // String variant of MNC, added API 29 (Q) — same switch as the int getter above.
+            if (hasStringVariants) {
+                hookSafe(() -> hook(SubscriptionInfo.class.getDeclaredMethod("getMncString"))
+                        .intercept(chain -> cfg.mnc));
+            }
         }
     }
 
@@ -154,38 +194,49 @@ public class PrivacyMaskModule extends XposedModule {
     // the app still reads them through the same Location getters in its own process.
     // -----------------------------------------------------------------
     private void hookLocation(FakeConfig cfg) {
-        hookSafe(() -> hook(Location.class.getDeclaredMethod("getLatitude"))
-                .intercept(chain -> cfg.latitude));
-        hookSafe(() -> hook(Location.class.getDeclaredMethod("getLongitude"))
-                .intercept(chain -> cfg.longitude));
-        hookSafe(() -> hook(Location.class.getDeclaredMethod("getAccuracy"))
-                .intercept(chain -> 15.0f));
-        hookSafe(() -> hook(LocationManager.class.getDeclaredMethod("getLastKnownLocation", String.class))
-                .intercept(chain -> {
-                    String provider = (String) chain.getArg(0);
-                    Location fake = new Location(provider);
-                    fake.setLatitude(cfg.latitude);
-                    fake.setLongitude(cfg.longitude);
-                    fake.setAccuracy(15.0f);
-                    fake.setTime(System.currentTimeMillis());
-                    fake.setElapsedRealtimeNanos(SystemClock.elapsedRealtimeNanos());
-                    return fake;
-                }));
+        if (cfg.isHookEnabled(ConfigKeys.HOOK_LOC_LATITUDE)) {
+            hookSafe(() -> hook(Location.class.getDeclaredMethod("getLatitude"))
+                    .intercept(chain -> cfg.latitude));
+        }
+        if (cfg.isHookEnabled(ConfigKeys.HOOK_LOC_LONGITUDE)) {
+            hookSafe(() -> hook(Location.class.getDeclaredMethod("getLongitude"))
+                    .intercept(chain -> cfg.longitude));
+        }
+        if (cfg.isHookEnabled(ConfigKeys.HOOK_LOC_ACCURACY)) {
+            hookSafe(() -> hook(Location.class.getDeclaredMethod("getAccuracy"))
+                    .intercept(chain -> 15.0f));
+        }
+        if (cfg.isHookEnabled(ConfigKeys.HOOK_LOC_LAST_KNOWN)) {
+            hookSafe(() -> hook(LocationManager.class.getDeclaredMethod("getLastKnownLocation", String.class))
+                    .intercept(chain -> {
+                        String provider = (String) chain.getArg(0);
+                        Location fake = new Location(provider);
+                        fake.setLatitude(cfg.latitude);
+                        fake.setLongitude(cfg.longitude);
+                        fake.setAccuracy(15.0f);
+                        fake.setTime(System.currentTimeMillis());
+                        fake.setElapsedRealtimeNanos(SystemClock.elapsedRealtimeNanos());
+                        return fake;
+                    }));
+        }
     }
 
     // -----------------------------------------------------------------
     // Timezone
     // -----------------------------------------------------------------
     private void hookTimeZone(FakeConfig cfg) {
-        hookSafe(() -> hook(TimeZone.class.getDeclaredMethod("getDefault"))
-                .intercept(chain -> TimeZone.getTimeZone(cfg.timezoneId)));
+        if (cfg.isHookEnabled(ConfigKeys.HOOK_TZ_DEFAULT)) {
+            hookSafe(() -> hook(TimeZone.class.getDeclaredMethod("getDefault"))
+                    .intercept(chain -> TimeZone.getTimeZone(cfg.timezoneId)));
+        }
 
         // java.time never asks TimeZone for anything — ZoneId.systemDefault() reads the
         // default zone independently, and everything downstream (ZonedDateTime.now(),
         // DateTimeFormatter "zzz"/"zzzz" patterns, etc.) derives from whatever it returns. So
         // without this hook, the modern java.time.* APIs leak the real zone even while
-        // TimeZone.getDefault() above is faked.
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        // TimeZone.getDefault() above is faked. It's a separate switch precisely because it's
+        // a separate call path.
+        if (cfg.isHookEnabled(ConfigKeys.HOOK_TZ_ZONEID) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             final ZoneId fakeZoneId = ZoneId.of(cfg.timezoneId);
             hookSafe(() -> hook(ZoneId.class.getDeclaredMethod("systemDefault"))
                     .intercept(chain -> fakeZoneId));
@@ -197,18 +248,22 @@ public class PrivacyMaskModule extends XposedModule {
     // -----------------------------------------------------------------
     private void hookLocale(FakeConfig cfg) {
         final Locale fakeLocale = new Locale(cfg.localeLang, cfg.localeCountry);
-        hookSafe(() -> hook(Locale.class.getDeclaredMethod("getDefault"))
-                .intercept(chain -> fakeLocale));
-        hookSafe(() -> hook(Locale.class.getDeclaredMethod("getDefault", Locale.Category.class))
-                .intercept(chain -> fakeLocale));
+
+        if (cfg.isHookEnabled(ConfigKeys.HOOK_LOCALE_DEFAULT)) {
+            hookSafe(() -> hook(Locale.class.getDeclaredMethod("getDefault"))
+                    .intercept(chain -> fakeLocale));
+            hookSafe(() -> hook(Locale.class.getDeclaredMethod("getDefault", Locale.Category.class))
+                    .intercept(chain -> fakeLocale));
+        }
 
         // getResources().getConfiguration().getLocales().get(0) never calls Locale.getDefault()
         // at all — Configuration carries its own LocaleList, filled in by the system when the
         // Configuration object is built, and every read after that (including .get(0)) comes
-        // straight from that field. So without this hook, the two hooks above are invisible to
+        // straight from that field. So without this hook, the switch above is invisible to
         // that whole call path and it leaks the device's real locale/country untouched — which
-        // is exactly the "US instead of CH" you're seeing.
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+        // is exactly the "US instead of CH" you're seeing. It's a separate switch precisely
+        // because it's a separate call path.
+        if (cfg.isHookEnabled(ConfigKeys.HOOK_LOCALE_CONFIGURATION) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             final LocaleList fakeLocaleList = new LocaleList(fakeLocale);
             hookSafe(() -> hook(Configuration.class.getDeclaredMethod("getLocales"))
                     .intercept(chain -> fakeLocaleList));
@@ -237,6 +292,18 @@ public class PrivacyMaskModule extends XposedModule {
     // fails, we skip the hook instead of taking down onPackageReady for everything else.
     // -----------------------------------------------------------------
     private void hookSystemProperties(FakeConfig cfg) {
+        // The two methods hooked below (get/get-with-default) are a single choke point shared
+        // by every property key, so there's no per-key way to only "half install" this hook —
+        // instead, whether a given key actually gets faked is decided inside
+        // fakeSystemProperty() below, one switch per key group. Skip installing entirely only
+        // if every one of those switches is off.
+        boolean anyEnabled = cfg.isHookEnabled(ConfigKeys.HOOK_PROP_TIMEZONE)
+                || cfg.isHookEnabled(ConfigKeys.HOOK_PROP_LOCALE)
+                || cfg.isHookEnabled(ConfigKeys.HOOK_PROP_COUNTRY_ISO)
+                || cfg.isHookEnabled(ConfigKeys.HOOK_PROP_OPERATOR_NUMERIC)
+                || cfg.isHookEnabled(ConfigKeys.HOOK_PROP_OPERATOR_ALPHA);
+        if (!anyEnabled) return;
+
         try {
             Class<?> spClass = Class.forName("android.os.SystemProperties");
             java.lang.reflect.Method getMethod = spClass.getDeclaredMethod("get", String.class);
@@ -256,24 +323,27 @@ public class PrivacyMaskModule extends XposedModule {
         }
     }
 
-    // Central map from property key to fake value. null means "not one of ours, pass through."
+    // Central map from property key to fake value. Returning null means "not one of ours (or
+    // its switch is off) — pass through to the real value" via chain.proceed() at the call
+    // site above.
     private String fakeSystemProperty(FakeConfig cfg, String key) {
         if (key == null) return null;
         switch (key) {
             case "persist.sys.timezone":
-                return cfg.timezoneId;
+                return cfg.isHookEnabled(ConfigKeys.HOOK_PROP_TIMEZONE) ? cfg.timezoneId : null;
             case "persist.sys.locale":
-                return cfg.localeLang + "-" + cfg.localeCountry;
+                return cfg.isHookEnabled(ConfigKeys.HOOK_PROP_LOCALE)
+                        ? cfg.localeLang + "-" + cfg.localeCountry : null;
             case "gsm.operator.iso-country":
             case "gsm.sim.operator.iso-country":
-                return cfg.isoCountry;
+                return cfg.isHookEnabled(ConfigKeys.HOOK_PROP_COUNTRY_ISO) ? cfg.isoCountry : null;
             case "gsm.operator.numeric":
             case "gsm.sim.operator.numeric":
-                return cfg.operatorNumeric();
+                return cfg.isHookEnabled(ConfigKeys.HOOK_PROP_OPERATOR_NUMERIC) ? cfg.operatorNumeric() : null;
             case "gsm.operator.alpha":
-                return cfg.networkOperatorName;
+                return cfg.isHookEnabled(ConfigKeys.HOOK_PROP_OPERATOR_ALPHA) ? cfg.networkOperatorName : null;
             case "gsm.sim.operator.alpha":
-                return cfg.simOperatorName;
+                return cfg.isHookEnabled(ConfigKeys.HOOK_PROP_OPERATOR_ALPHA) ? cfg.simOperatorName : null;
             default:
                 return null;
         }

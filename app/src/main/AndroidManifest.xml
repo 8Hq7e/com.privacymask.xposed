@@ -12,7 +12,7 @@
         android:label="@string/app_name"
         android:description="@string/module_description"
         android:icon="@android:drawable/ic_lock_lock"
-        android:theme="@android:style/Theme.DeviceDefault.Light"
+        android:theme="@style/Theme.PrivacyMask"
         tools:targetApi="35">
 
         <activity

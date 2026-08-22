@@ -1,44 +1,95 @@
 package com.privacymask.xposed;
 
-import android.app.Activity;
 import android.content.SharedPreferences;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.text.Editable;
+import android.text.TextWatcher;
+import android.view.Gravity;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
+import android.widget.CompoundButton;
 import android.widget.EditText;
+import android.widget.LinearLayout;
 import android.widget.Spinner;
+import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import java.io.OutputStream;
+import androidx.activity.EdgeToEdge;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.graphics.Insets;
+import androidx.core.view.ViewCompat;
+import androidx.core.view.WindowInsetsCompat;
+
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Random;
 
 import io.github.libxposed.service.XposedService;
 
-public class MainActivity extends Activity implements PrivacyMaskApp.ServiceStateListener {
+public class MainActivity extends AppCompatActivity implements PrivacyMaskApp.ServiceStateListener {
+
+    /** How long to wait after the user stops typing in a text field before saving. */
+    private static final long SAVE_DEBOUNCE_MS = 600;
 
     private Spinner spinnerCountry;
-    private EditText editLat, editLng, editPhone, editScope;
-    private Button btnRandomize, btnApply;
+    private EditText editLat, editLng, editPhone;
+    private ViewGroup hooksContainer;
+    /** One Switch per individual hook, keyed by its ConfigKeys.HOOK_* key. Built once in
+     *  onCreate() from HookCatalog and reused for the whole activity lifetime. */
+    private final Map<String, Switch> hookSwitches = new LinkedHashMap<>();
+    private Button btnRandomize;
     private TextView txtStatus;
+    private WorldMapView mapView;
 
     private List<CountryProfile> profiles;
     private XposedService service;
 
+    // Guards against feedback loops / premature autosaves while we're programmatically
+    // populating the controls (initial load) or syncing the map <-> text fields.
+    private boolean loading = false;
+    private boolean updatingFromMap = false;
+
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    private final Runnable debouncedSave = this::saveAndApply;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        EdgeToEdge.enable(this);
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
+
+        View root = findViewById(R.id.main);
+        // Capture the padding already set from XML (android:padding="20dp") once, before the
+        // inset listener starts overwriting it, so every inset update adds to that base
+        // instead of replacing it outright.
+        final int basePadLeft = root.getPaddingLeft();
+        final int basePadTop = root.getPaddingTop();
+        final int basePadRight = root.getPaddingRight();
+        final int basePadBottom = root.getPaddingBottom();
+        ViewCompat.setOnApplyWindowInsetsListener(root, (v, insets) -> {
+            Insets systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars());
+            v.setPadding(basePadLeft + systemBars.left, basePadTop + systemBars.top,
+                    basePadRight + systemBars.right, basePadBottom + systemBars.bottom);
+            return insets;
+        });
 
         spinnerCountry = findViewById(R.id.spinnerCountry);
         editLat = findViewById(R.id.editLat);
         editLng = findViewById(R.id.editLng);
         editPhone = findViewById(R.id.editPhone);
-        editScope = findViewById(R.id.editScope);
+        mapView = findViewById(R.id.mapView);
+        hooksContainer = findViewById(R.id.hooksContainer);
         btnRandomize = findViewById(R.id.btnRandomize);
-        btnApply = findViewById(R.id.btnApply);
         txtStatus = findViewById(R.id.txtStatus);
 
         profiles = CountryProfile.all();
@@ -47,14 +98,15 @@ public class MainActivity extends Activity implements PrivacyMaskApp.ServiceStat
         for (CountryProfile p : profiles) adapter.add(p.displayName + " (" + p.isoCountry.toUpperCase(Locale.US) + ")");
         spinnerCountry.setAdapter(adapter);
 
+        buildHookSwitches();
+        wireUpAutoSave();
+
         btnRandomize.setOnClickListener(v -> {
             if (service == null) return;
             ConfigStore.randomize(service.getRemotePreferences(ConfigKeys.GROUP));
             loadFromPrefs();
             Toast.makeText(this, "Generated a new random identity.", Toast.LENGTH_SHORT).show();
         });
-
-        btnApply.setOnClickListener(v -> applyChanges());
 
         setControlsEnabled(false);
         txtStatus.setText("Connecting to the Xposed framework…");
@@ -68,6 +120,7 @@ public class MainActivity extends Activity implements PrivacyMaskApp.ServiceStat
 
     @Override
     protected void onStop() {
+        handler.removeCallbacks(debouncedSave);
         PrivacyMaskApp.removeServiceStateListener(this);
         super.onStop();
     }
@@ -90,17 +143,125 @@ public class MainActivity extends Activity implements PrivacyMaskApp.ServiceStat
         });
     }
 
+    // -----------------------------------------------------------------
+    // Builds the "Hooks" section from HookCatalog: a bold header per group, followed by one
+    // Switch per individual hook in that group. Populates hookSwitches so the rest of the
+    // activity can read/write every switch generically instead of by field name.
+    // -----------------------------------------------------------------
+    private void buildHookSwitches() {
+        int dp8 = dpToPx(8);
+        int dp16 = dpToPx(16);
+
+        for (HookCatalog.Group group : HookCatalog.GROUPS) {
+            TextView header = new TextView(this);
+            header.setText(group.title);
+            header.setTextSize(14);
+            header.setTypeface(header.getTypeface(), android.graphics.Typeface.BOLD);
+            LinearLayout.LayoutParams headerParams = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            headerParams.topMargin = dp16;
+            header.setLayoutParams(headerParams);
+            hooksContainer.addView(header);
+
+            for (HookCatalog.Hook hook : group.hooks) {
+                Switch sw = new Switch(this);
+                sw.setText(hook.label);
+                sw.setGravity(Gravity.CENTER_VERTICAL);
+                LinearLayout.LayoutParams swParams = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                swParams.topMargin = dp8;
+                sw.setLayoutParams(swParams);
+                hooksContainer.addView(sw);
+                hookSwitches.put(hook.key, sw);
+            }
+        }
+    }
+
+    private int dpToPx(int dp) {
+        return (int) (dp * getResources().getDisplayMetrics().density);
+    }
+
+    // -----------------------------------------------------------------
+    // Autosave wiring: every control below saves and applies on its own, the moment it
+    // changes. There's no separate Apply button — text fields are debounced briefly so we
+    // don't write on every keystroke, everything else (spinner, switches, map release) saves
+    // right away.
+    // -----------------------------------------------------------------
+    private void wireUpAutoSave() {
+        TextWatcher autoSaveWatcher = new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {}
+
+            @Override
+            public void afterTextChanged(Editable s) {
+                if (loading || updatingFromMap) return;
+                // Keep the pin in sync while the user hand-types coordinates.
+                Double lat = parseOrNull(editLat.getText().toString());
+                Double lng = parseOrNull(editLng.getText().toString());
+                if (lat != null && lng != null) mapView.setLocation(lat, lng);
+                scheduleDebouncedSave();
+            }
+        };
+        editLat.addTextChangedListener(autoSaveWatcher);
+        editLng.addTextChangedListener(autoSaveWatcher);
+        editPhone.addTextChangedListener(autoSaveWatcher);
+
+        spinnerCountry.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                if (!loading) saveAndApply();
+            }
+            @Override public void onNothingSelected(AdapterView<?> parent) {}
+        });
+
+        CompoundButton.OnCheckedChangeListener toggleListener =
+                (buttonView, isChecked) -> { if (!loading) saveAndApply(); };
+        for (Switch sw : hookSwitches.values()) {
+            sw.setOnCheckedChangeListener(toggleListener);
+        }
+
+        mapView.setOnLocationChangeListener(new WorldMapView.OnLocationChangeListener() {
+            @Override
+            public void onLocationPreview(double lat, double lng) {
+                updatingFromMap = true;
+                editLat.setText(formatCoord(lat));
+                editLng.setText(formatCoord(lng));
+                updatingFromMap = false;
+            }
+
+            @Override
+            public void onLocationCommitted(double lat, double lng) {
+                updatingFromMap = true;
+                editLat.setText(formatCoord(lat));
+                editLng.setText(formatCoord(lng));
+                updatingFromMap = false;
+                if (!loading) {
+                    handler.removeCallbacks(debouncedSave);
+                    saveAndApply();
+                }
+            }
+        });
+    }
+
+    private void scheduleDebouncedSave() {
+        handler.removeCallbacks(debouncedSave);
+        handler.postDelayed(debouncedSave, SAVE_DEBOUNCE_MS);
+    }
+
     private void setControlsEnabled(boolean enabled) {
         spinnerCountry.setEnabled(enabled);
         editLat.setEnabled(enabled);
         editLng.setEnabled(enabled);
         editPhone.setEnabled(enabled);
-        editScope.setEnabled(enabled);
+        mapView.setEnabled(enabled);
+        for (Switch sw : hookSwitches.values()) {
+            sw.setEnabled(enabled);
+        }
         btnRandomize.setEnabled(enabled);
-        btnApply.setEnabled(enabled);
     }
 
     private void loadFromPrefs() {
+        loading = true;
         SharedPreferences sp = service.getRemotePreferences(ConfigKeys.GROUP);
         String iso = sp.getString(ConfigKeys.COUNTRY, "de");
         for (int i = 0; i < profiles.size(); i++) {
@@ -109,23 +270,36 @@ public class MainActivity extends Activity implements PrivacyMaskApp.ServiceStat
                 break;
             }
         }
-        editLat.setText(String.valueOf(sp.getFloat(ConfigKeys.LAT, 52.5f)));
-        editLng.setText(String.valueOf(sp.getFloat(ConfigKeys.LNG, 13.4f)));
+
+        double lat = sp.getFloat(ConfigKeys.LAT, 52.5f);
+        double lng = sp.getFloat(ConfigKeys.LNG, 13.4f);
+        editLat.setText(formatCoord(lat));
+        editLng.setText(formatCoord(lng));
+        mapView.setLocation(lat, lng);
+
         editPhone.setText(sp.getString(ConfigKeys.PHONE, ""));
-        editScope.setText(sp.getString(ConfigKeys.SCOPE, ""));
+
+        for (HookCatalog.Hook hook : HookCatalog.allHooks()) {
+            Switch sw = hookSwitches.get(hook.key);
+            if (sw != null) sw.setChecked(sp.getBoolean(hook.key, true));
+        }
+
         txtStatus.setText("Connected.");
+        loading = false;
     }
 
     /**
-     * Saves the changes to the module's remote preferences (writable from here — PrivacyMask's
-     * own process — even though hooked apps only ever get a read-only view of the same data),
-     * bumps the config version, and — if root access is available — force-stops every package
-     * listed in the "extra filter" field so they restart with the new identity right away.
-     * Without root, the config is still saved; the user just needs to manually close and
-     * reopen the target apps (or reboot).
+     * Saves every control's current value to the module's remote preferences (writable from
+     * here — PrivacyMask's own process — even though hooked apps only ever get a read-only
+     * view of the same data) and bumps the config version. Called automatically the moment
+     * anything changes; there's no separate Apply step.
+     *
+     * A process that's already running when this fires needs a manual force-stop + reopen (or
+     * reboot) to pick up the new values — PrivacyMask never force-stops other apps itself.
      */
-    private void applyChanges() {
-        if (service == null) return;
+    private void saveAndApply() {
+        if (service == null || loading) return;
+
         SharedPreferences.Editor e = service.getRemotePreferences(ConfigKeys.GROUP).edit();
         CountryProfile selected = profiles.get(spinnerCountry.getSelectedItemPosition());
         e.putString(ConfigKeys.COUNTRY, selected.isoCountry);
@@ -137,56 +311,34 @@ public class MainActivity extends Activity implements PrivacyMaskApp.ServiceStat
         e.putString(ConfigKeys.LOCALE_LANG, selected.localeLanguage);
         e.putString(ConfigKeys.LOCALE_COUNTRY, selected.localeCountry);
 
-        try {
-            e.putFloat(ConfigKeys.LAT, Float.parseFloat(editLat.getText().toString().trim()));
-        } catch (NumberFormatException ignored) {
-            e.putFloat(ConfigKeys.LAT, (float) selected.randomLat(new Random()));
-        }
-        try {
-            e.putFloat(ConfigKeys.LNG, Float.parseFloat(editLng.getText().toString().trim()));
-        } catch (NumberFormatException ignored) {
-            e.putFloat(ConfigKeys.LNG, (float) selected.randomLng(new Random()));
-        }
+        Double lat = parseOrNull(editLat.getText().toString());
+        Double lng = parseOrNull(editLng.getText().toString());
+        e.putFloat(ConfigKeys.LAT, lat != null ? lat.floatValue() : (float) selected.randomLat(new Random()));
+        e.putFloat(ConfigKeys.LNG, lng != null ? lng.floatValue() : (float) selected.randomLng(new Random()));
 
         e.putString(ConfigKeys.PHONE, editPhone.getText().toString().trim());
-        e.putString(ConfigKeys.SCOPE, editScope.getText().toString().trim());
+
+        for (Map.Entry<String, Switch> entry : hookSwitches.entrySet()) {
+            e.putBoolean(entry.getKey(), entry.getValue().isChecked());
+        }
+
         e.apply();
         ConfigStore.bumpVersion(service.getRemotePreferences(ConfigKeys.GROUP));
 
-        String scope = editScope.getText().toString().trim();
-        boolean restarted = false;
-        if (!scope.isEmpty()) {
-            restarted = tryForceStopViaRoot(scope.split(","));
-        }
+        String time = new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date());
+        txtStatus.setText("Saved at " + time + ". Already-running target apps need a manual "
+                + "force-stop + reopen (or reboot) to pick this up.");
+    }
 
-        if (restarted) {
-            txtStatus.setText("Saved. Target apps were force-stopped — the new identity applies the next time you open them.");
-        } else if (!scope.isEmpty()) {
-            txtStatus.setText("Saved, but no root access was found for auto-restart. Please force-stop the target apps manually (Android Settings, or your framework Manager app).");
-        } else {
-            txtStatus.setText("Saved (filter = every app enabled in the Manager's scope screen). For it to fully apply, close and reopen those apps, or reboot.");
+    private static Double parseOrNull(String s) {
+        try {
+            return Double.parseDouble(s.trim());
+        } catch (NumberFormatException | NullPointerException ex) {
+            return null;
         }
     }
 
-    /** Attempts to run `su -c "am force-stop <pkg>"` for each package in the filter list. */
-    private boolean tryForceStopViaRoot(String[] packages) {
-        boolean anySuccess = false;
-        for (String pkg : packages) {
-            String p = pkg.trim();
-            if (p.isEmpty()) continue;
-            try {
-                Process proc = Runtime.getRuntime().exec("su");
-                OutputStream os = proc.getOutputStream();
-                os.write(("am force-stop " + p + "\n").getBytes());
-                os.write("exit\n".getBytes());
-                os.flush();
-                os.close();
-                int code = proc.waitFor();
-                if (code == 0) anySuccess = true;
-            } catch (Exception ex) {
-                // No root / su unavailable — ignored, the status text covers this case.
-            }
-        }
-        return anySuccess;
+    private static String formatCoord(double v) {
+        return String.format(Locale.US, "%.5f", v);
     }
 }

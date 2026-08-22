@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/main"
     android:layout_width="match_parent"
     android:layout_height="match_parent">
 
@@ -20,7 +21,7 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginBottom="16dp"
-            android:text="Hide your real location and identity from apps" />
+            android:text="Hide your real location and identity from apps." />
 
         <TextView
             android:layout_width="wrap_content"
@@ -37,6 +38,18 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginTop="16dp"
+            android:text="Fake location — drag the pin, or edit the numbers below:" />
+
+        <com.privacymask.xposed.WorldMapView
+            android:id="@+id/mapView"
+            android:layout_width="match_parent"
+            android:layout_height="260dp"
+            android:layout_marginTop="8dp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
             android:text="Latitude:" />
         <EditText
             android:id="@+id/editLat"
@@ -64,17 +77,6 @@
             android:layout_height="wrap_content"
             android:inputType="phone" />
 
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:text="Extra in-app filter — comma-separated package names (leave empty to apply to every app enabled in the Manager's scope screen):" />
-        <EditText
-            android:id="@+id/editScope"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:hint="e.g. com.instagram.android,com.whatsapp" />
-
         <Button
             android:id="@+id/btnRandomize"
             android:layout_width="match_parent"
@@ -82,18 +84,32 @@
             android:layout_marginTop="20dp"
             android:text="Generate a new random identity" />
 
-        <Button
-            android:id="@+id/btnApply"
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="20dp"
+            android:background="#E0E0E0" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="Hooks — choose which of these get faked:"
+            android:textStyle="bold" />
+
+        <!-- Filled programmatically in MainActivity: one Switch per individual hook (see
+             HookCatalog), with a bold header TextView above each group. -->
+        <LinearLayout
+            android:id="@+id/hooksContainer"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
-            android:text="Apply changes and reload target apps" />
+            android:orientation="vertical" />
 
         <TextView
             android:id="@+id/txtStatus"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
+            android:layout_marginTop="20dp"
             android:textSize="12sp" />
 
     </LinearLayout>
