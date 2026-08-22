@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">PrivacyMask</string>
+    <string name="module_description">Feeds apps a fake timezone, SIM/carrier, locale and GPS location so they can\'t fingerprint your real location or country.</string>
+</resources>

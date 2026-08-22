@@ -1,0 +1,38 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.privacymask.xposed'
+    compileSdk 37
+
+    defaultConfig {
+        applicationId 'com.privacymask.xposed'
+        minSdk 26
+        targetSdk 37
+        versionCode 1
+        versionName '1.0.0'
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    // libxposed API 102 — compile-time only, the framework (Vector/LSPosed) supplies the
+    // real implementation at runtime. Published on Maven Central.
+    compileOnly 'io.github.libxposed:api:102.0.0'
+
+    // libxposed Service 102 — used by MainActivity (this app's own process) to bind to the
+    // framework and read/write remote preferences. Unlike the API above, this one does need
+    // to ship inside the APK, hence 'implementation' rather than 'compileOnly'.
+    implementation 'io.github.libxposed:service:102.0.0'
+}
