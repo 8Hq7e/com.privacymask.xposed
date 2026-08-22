@@ -1,7 +1,6 @@
 # PrivacyMask
 
-Xposed module (libxposed API 102) that feeds hooked apps a fake, user-configurable identity
-instead of the device's real one.
+Feeds apps a fake timezone, SIM/carrier, locale and GPS location so they can\'t fingerprint your real location or country.
 
 ## What it does
 
