@@ -1,5 +1,10 @@
 # PrivacyMask
 
+> Development baseline: [docs/DEVELOPMENT-ROADMAP.md](docs/DEVELOPMENT-ROADMAP.md)
+>
+> The roadmap defines the supported-coverage contract, implementation order, release gates,
+> two-device acceptance matrix, and the criteria for any future native/Zygisk expansion.
+
 Feeds apps a fake timezone, SIM/carrier, locale and GPS location so they can\'t fingerprint your real location or country.
 
 ## What it does
