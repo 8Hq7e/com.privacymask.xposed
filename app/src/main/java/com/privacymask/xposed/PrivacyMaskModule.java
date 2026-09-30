@@ -6,7 +6,9 @@ import android.content.res.Configuration;
 import android.location.Location;
 import android.location.LocationManager;
 import android.os.Build;
+import android.os.Handler;
 import android.os.LocaleList;
+import android.os.Looper;
 import android.os.SystemClock;
 import android.telephony.SubscriptionInfo;
 import android.telephony.TelephonyManager;
@@ -62,6 +64,8 @@ public class PrivacyMaskModule extends XposedModule {
     private HookHandle[] chromiumLoaderObserverHandles;
     private HookHandle chromiumWebViewTriggerHandle;
     private HookHandle chromiumTargetHookHandle;
+    private Handler chromiumObserverTimeoutHandler;
+    private Runnable chromiumObserverTimeoutRunnable;
     private long chromiumObserverStartedAtMs;
     private int chromiumObservedClassLoads;
 
@@ -334,7 +338,16 @@ public class PrivacyMaskModule extends XposedModule {
             Class<?> monitorClass =
                     Class.forName(CHROMIUM_TIMEZONE_MONITOR, false, loader);
             HookHandle handle = installChromiumTimeZoneMonitorHook(monitorClass, cfg);
-            if (handle == null) return false;
+            if (handle == null) {
+                synchronized (chromiumAdapterLock) {
+                    setChromiumAdapterStateLocked(
+                            ChromiumAdapterState.FAILED,
+                            "TimeZoneMonitor visible but target hook installation failed");
+                    cleanupChromiumLoaderObserverLocked();
+                    cleanupWebViewTriggerLocked();
+                }
+                return false;
+            }
 
             synchronized (chromiumAdapterLock) {
                 chromiumTargetHookHandle = handle;
@@ -348,7 +361,13 @@ public class PrivacyMaskModule extends XposedModule {
         } catch (ClassNotFoundException e) {
             return false;
         } catch (Throwable t) {
-            log(Log.WARN, TAG, "Chromium TimeZoneMonitor immediate hook unavailable: " + t);
+            synchronized (chromiumAdapterLock) {
+                setChromiumAdapterStateLocked(
+                        ChromiumAdapterState.FAILED,
+                        "immediate TimeZoneMonitor hook failed: " + t);
+                cleanupChromiumLoaderObserverLocked();
+                cleanupWebViewTriggerLocked();
+            }
             return false;
         }
     }
@@ -481,6 +500,7 @@ public class PrivacyMaskModule extends XposedModule {
             synchronized (chromiumAdapterLock) {
                 if (chromiumAdapterState == ChromiumAdapterState.ARMED) {
                     chromiumLoaderObserverHandles = handles;
+                    scheduleChromiumObserverTimeoutLocked();
                     log(Log.INFO, TAG,
                             "Chromium TimeZoneMonitor loader observer ARMED"
                                     + " (maxLoads=" + CHROMIUM_LOADER_MAX_CLASS_LOADS
@@ -557,7 +577,46 @@ public class PrivacyMaskModule extends XposedModule {
         }
     }
 
+    private void scheduleChromiumObserverTimeoutLocked() {
+        Looper mainLooper = Looper.getMainLooper();
+        if (mainLooper == null) {
+            log(Log.WARN, TAG,
+                    "Chromium loader observer has no main Looper; "
+                            + "class-load-count bound remains active");
+            return;
+        }
+
+        if (chromiumObserverTimeoutHandler == null) {
+            chromiumObserverTimeoutHandler = new Handler(mainLooper);
+        }
+        if (chromiumObserverTimeoutRunnable != null) {
+            chromiumObserverTimeoutHandler.removeCallbacks(chromiumObserverTimeoutRunnable);
+        }
+
+        chromiumObserverTimeoutRunnable = () -> {
+            synchronized (chromiumAdapterLock) {
+                if (chromiumAdapterState != ChromiumAdapterState.ARMED) return;
+                long ageMs =
+                        SystemClock.elapsedRealtime() - chromiumObserverStartedAtMs;
+                setChromiumAdapterStateLocked(
+                        ChromiumAdapterState.EXPIRED,
+                        "wall-clock observer timeout after " + ageMs + " ms");
+                cleanupChromiumLoaderObserverLocked();
+                cleanupWebViewTriggerLocked();
+            }
+        };
+        chromiumObserverTimeoutHandler.postDelayed(
+                chromiumObserverTimeoutRunnable, CHROMIUM_LOADER_MAX_AGE_MS);
+    }
+
     private void cleanupChromiumLoaderObserverLocked() {
+        if (chromiumObserverTimeoutHandler != null
+                && chromiumObserverTimeoutRunnable != null) {
+            chromiumObserverTimeoutHandler.removeCallbacks(
+                    chromiumObserverTimeoutRunnable);
+        }
+        chromiumObserverTimeoutRunnable = null;
+
         HookHandle[] handles = chromiumLoaderObserverHandles;
         chromiumLoaderObserverHandles = null;
         if (handles != null) {
