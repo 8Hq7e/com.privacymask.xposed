@@ -1,6 +1,5 @@
 package com.privacymask.xposed;
 
-import android.content.SharedPreferences;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -9,7 +8,6 @@ import android.text.TextWatcher;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
-import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.CompoundButton;
@@ -27,8 +25,6 @@ import androidx.core.view.ViewCompat;
 import androidx.core.view.WindowInsetsCompat;
 
 import java.text.SimpleDateFormat;
-import java.time.DateTimeException;
-import java.time.ZoneId;
 import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -37,7 +33,8 @@ import java.util.Map;
 
 import io.github.libxposed.service.XposedService;
 
-public class MainActivity extends AppCompatActivity implements PrivacyMaskApp.ServiceStateListener {
+public class MainActivity extends AppCompatActivity
+        implements PrivacyMaskApp.ServiceStateListener {
 
     private static final long SAVE_DEBOUNCE_MS = 600;
 
@@ -57,6 +54,7 @@ public class MainActivity extends AppCompatActivity implements PrivacyMaskApp.Se
 
     private boolean loading = false;
     private boolean updatingFromMap = false;
+    private boolean pendingSave = false;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Runnable debouncedSave = this::saveAndApply;
@@ -73,9 +71,13 @@ public class MainActivity extends AppCompatActivity implements PrivacyMaskApp.Se
         final int basePadRight = root.getPaddingRight();
         final int basePadBottom = root.getPaddingBottom();
         ViewCompat.setOnApplyWindowInsetsListener(root, (v, insets) -> {
-            Insets systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars());
-            v.setPadding(basePadLeft + systemBars.left, basePadTop + systemBars.top,
-                    basePadRight + systemBars.right, basePadBottom + systemBars.bottom);
+            Insets systemBars =
+                    insets.getInsets(WindowInsetsCompat.Type.systemBars());
+            v.setPadding(
+                    basePadLeft + systemBars.left,
+                    basePadTop + systemBars.top,
+                    basePadRight + systemBars.right,
+                    basePadBottom + systemBars.bottom);
             return insets;
         });
 
@@ -98,10 +100,12 @@ public class MainActivity extends AppCompatActivity implements PrivacyMaskApp.Se
         txtStatus = findViewById(R.id.txtStatus);
 
         profiles = CountryProfile.all();
-        ArrayAdapter<String> adapter = new ArrayAdapter<>(this,
-                android.R.layout.simple_spinner_dropdown_item);
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(
+                this, android.R.layout.simple_spinner_dropdown_item);
         for (CountryProfile p : profiles) {
-            adapter.add(p.displayName + " (" + p.isoCountry.toUpperCase(Locale.US) + ")");
+            adapter.add(
+                    p.displayName + " ("
+                            + p.isoCountry.toUpperCase(Locale.US) + ")");
         }
         spinnerCountry.setAdapter(adapter);
 
@@ -112,14 +116,27 @@ public class MainActivity extends AppCompatActivity implements PrivacyMaskApp.Se
             int position = spinnerCountry.getSelectedItemPosition();
             if (position < 0 || position >= profiles.size()) return;
             applyProfileDefaults(profiles.get(position));
+            pendingSave = true;
             saveAndApply();
         });
 
         btnRandomize.setOnClickListener(v -> {
             if (service == null) return;
-            ConfigStore.randomize(service.getRemotePreferences(ConfigKeys.GROUP));
-            loadFromPrefs();
-            Toast.makeText(this, "Generated a new random identity.", Toast.LENGTH_SHORT).show();
+            handler.removeCallbacks(debouncedSave);
+            pendingSave = false;
+
+            ConfigStore.SaveResult result = ConfigStore.randomize(
+                    service.getRemotePreferences(ConfigKeys.GROUP));
+            if (!result.success) {
+                showPersistenceError(result.error);
+                return;
+            }
+
+            loadSnapshot(result.snapshot, "Random identity saved.");
+            Toast.makeText(
+                    this,
+                    "Generated a new random identity.",
+                    Toast.LENGTH_SHORT).show();
         });
 
         setControlsEnabled(false);
@@ -135,6 +152,13 @@ public class MainActivity extends AppCompatActivity implements PrivacyMaskApp.Se
     @Override
     protected void onStop() {
         handler.removeCallbacks(debouncedSave);
+
+        // A debounced valid edit must not disappear merely because the Activity stopped before
+        // 600 ms elapsed. Persist it synchronously before dropping the service listener.
+        if (pendingSave && service != null && !loading) {
+            saveAndApply();
+        }
+
         PrivacyMaskApp.removeServiceStateListener(this);
         super.onStop();
     }
@@ -145,13 +169,30 @@ public class MainActivity extends AppCompatActivity implements PrivacyMaskApp.Se
             service = boundService;
             if (service == null) {
                 setControlsEnabled(false);
-                txtStatus.setText("Not connected — make sure PrivacyMask is enabled in your "
-                        + "framework's Manager app, then reopen this screen.");
+                txtStatus.setText(
+                        "Not connected — make sure PrivacyMask is enabled in your "
+                                + "framework's Manager app, then reopen this screen.");
                 return;
             }
-            ConfigStore.ensureDefaultRandomConfig(service.getRemotePreferences(ConfigKeys.GROUP));
+
+            ConfigStore.LoadResult result = ConfigStore.ensureConfig(
+                    service.getRemotePreferences(ConfigKeys.GROUP));
+            if (!result.success()) {
+                setControlsEnabled(false);
+                showPersistenceError(result.error);
+                return;
+            }
+
             setControlsEnabled(true);
-            loadFromPrefs();
+            String status;
+            if (result.migratedLegacy) {
+                status = "Migrated PrivacyMask 1.2.x settings to atomic config snapshot.";
+            } else if (result.createdDefault) {
+                status = "Initialized deterministic default identity.";
+            } else {
+                status = "Connected.";
+            }
+            loadSnapshot(result.snapshot, status);
         });
     }
 
@@ -163,9 +204,13 @@ public class MainActivity extends AppCompatActivity implements PrivacyMaskApp.Se
             TextView header = new TextView(this);
             header.setText(group.title);
             header.setTextSize(14);
-            header.setTypeface(header.getTypeface(), android.graphics.Typeface.BOLD);
-            LinearLayout.LayoutParams headerParams = new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            header.setTypeface(
+                    header.getTypeface(),
+                    android.graphics.Typeface.BOLD);
+            LinearLayout.LayoutParams headerParams =
+                    new LinearLayout.LayoutParams(
+                            ViewGroup.LayoutParams.WRAP_CONTENT,
+                            ViewGroup.LayoutParams.WRAP_CONTENT);
             headerParams.topMargin = dp16;
             header.setLayoutParams(headerParams);
             hooksContainer.addView(header);
@@ -174,8 +219,10 @@ public class MainActivity extends AppCompatActivity implements PrivacyMaskApp.Se
                 Switch sw = new Switch(this);
                 sw.setText(hook.label);
                 sw.setGravity(Gravity.CENTER_VERTICAL);
-                LinearLayout.LayoutParams swParams = new LinearLayout.LayoutParams(
-                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                LinearLayout.LayoutParams swParams =
+                        new LinearLayout.LayoutParams(
+                                ViewGroup.LayoutParams.MATCH_PARENT,
+                                ViewGroup.LayoutParams.WRAP_CONTENT);
                 swParams.topMargin = dp8;
                 sw.setLayoutParams(swParams);
                 hooksContainer.addView(sw);
@@ -190,17 +237,21 @@ public class MainActivity extends AppCompatActivity implements PrivacyMaskApp.Se
 
     private void wireUpAutoSave() {
         TextWatcher autoSaveWatcher = new TextWatcher() {
-            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
-            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {}
+            @Override
+            public void beforeTextChanged(
+                    CharSequence s, int start, int count, int after) {}
+
+            @Override
+            public void onTextChanged(
+                    CharSequence s, int start, int before, int count) {}
 
             @Override
             public void afterTextChanged(Editable s) {
                 if (loading || updatingFromMap) return;
+
                 Double lat = parseOrNull(editLat.getText().toString());
                 Double lng = parseOrNull(editLng.getText().toString());
-                if (lat != null && lng != null
-                        && lat >= -90.0 && lat <= 90.0
-                        && lng >= -180.0 && lng <= 180.0) {
+                if (isFiniteCoordinatePair(lat, lng)) {
                     mapView.setLocation(lat, lng);
                 }
                 scheduleDebouncedSave();
@@ -220,39 +271,41 @@ public class MainActivity extends AppCompatActivity implements PrivacyMaskApp.Se
         editPhone.addTextChangedListener(autoSaveWatcher);
 
         CompoundButton.OnCheckedChangeListener toggleListener =
-                (buttonView, isChecked) -> { if (!loading) saveAndApply(); };
+                (buttonView, isChecked) -> {
+                    if (!loading) {
+                        pendingSave = true;
+                        saveAndApply();
+                    }
+                };
         for (Switch sw : hookSwitches.values()) {
             sw.setOnCheckedChangeListener(toggleListener);
         }
 
-        mapView.setOnLocationChangeListener(new WorldMapView.OnLocationChangeListener() {
-            @Override
-            public void onLocationPreview(double lat, double lng) {
-                updatingFromMap = true;
-                editLat.setText(formatCoord(lat));
-                editLng.setText(formatCoord(lng));
-                updatingFromMap = false;
-            }
+        mapView.setOnLocationChangeListener(
+                new WorldMapView.OnLocationChangeListener() {
+                    @Override
+                    public void onLocationPreview(double lat, double lng) {
+                        updatingFromMap = true;
+                        editLat.setText(formatCoord(lat));
+                        editLng.setText(formatCoord(lng));
+                        updatingFromMap = false;
+                    }
 
-            @Override
-            public void onLocationCommitted(double lat, double lng) {
-                updatingFromMap = true;
-                editLat.setText(formatCoord(lat));
-                editLng.setText(formatCoord(lng));
-                updatingFromMap = false;
-                if (!loading) {
-                    handler.removeCallbacks(debouncedSave);
-                    saveAndApply();
-                }
-            }
-        });
+                    @Override
+                    public void onLocationCommitted(double lat, double lng) {
+                        updatingFromMap = true;
+                        editLat.setText(formatCoord(lat));
+                        editLng.setText(formatCoord(lng));
+                        updatingFromMap = false;
+                        if (!loading) {
+                            handler.removeCallbacks(debouncedSave);
+                            pendingSave = true;
+                            saveAndApply();
+                        }
+                    }
+                });
     }
 
-    /**
-     * The country spinner is now a preset loader, not the source of truth. It refreshes the
-     * country/operator/timezone/locale fields but deliberately leaves phone number and GPS
-     * untouched so a stable manually chosen identity is not changed just by browsing presets.
-     */
     private void applyProfileDefaults(CountryProfile p) {
         boolean previousLoading = loading;
         loading = true;
@@ -268,6 +321,7 @@ public class MainActivity extends AppCompatActivity implements PrivacyMaskApp.Se
     }
 
     private void scheduleDebouncedSave() {
+        pendingSave = true;
         handler.removeCallbacks(debouncedSave);
         handler.postDelayed(debouncedSave, SAVE_DEBOUNCE_MS);
     }
@@ -294,120 +348,157 @@ public class MainActivity extends AppCompatActivity implements PrivacyMaskApp.Se
     }
 
     private void loadFromPrefs() {
-        loading = true;
-        SharedPreferences sp = service.getRemotePreferences(ConfigKeys.GROUP);
+        if (service == null) return;
+        ConfigStore.LoadResult result = ConfigStore.ensureConfig(
+                service.getRemotePreferences(ConfigKeys.GROUP));
+        if (!result.success()) {
+            showPersistenceError(result.error);
+            return;
+        }
+        loadSnapshot(result.snapshot, "Connected.");
+    }
 
-        String iso = sp.getString(ConfigKeys.COUNTRY, "de");
+    private void loadSnapshot(ConfigSnapshot snapshot, String status) {
+        loading = true;
+        pendingSave = false;
+
         for (int i = 0; i < profiles.size(); i++) {
-            if (profiles.get(i).isoCountry.equalsIgnoreCase(iso)) {
+            if (profiles.get(i).isoCountry.equalsIgnoreCase(snapshot.isoCountry)) {
                 spinnerCountry.setSelection(i);
                 break;
             }
         }
 
-        editCountryIso.setText(iso);
-        editMcc.setText(sp.getString(ConfigKeys.MCC, "262"));
-        editMnc.setText(sp.getString(ConfigKeys.MNC, "01"));
-        editSimOperatorName.setText(sp.getString(ConfigKeys.SIM_OP_NAME, ""));
-        editNetworkOperatorName.setText(sp.getString(ConfigKeys.NET_OP_NAME, ""));
-        editTimezone.setText(sp.getString(ConfigKeys.TIMEZONE, "Europe/Berlin"));
-        editLocaleLanguage.setText(sp.getString(ConfigKeys.LOCALE_LANG, "de"));
-        editLocaleCountry.setText(sp.getString(ConfigKeys.LOCALE_COUNTRY, "DE"));
-        editPhone.setText(sp.getString(ConfigKeys.PHONE, ""));
-
-        double lat = sp.getFloat(ConfigKeys.LAT, 52.5f);
-        double lng = sp.getFloat(ConfigKeys.LNG, 13.4f);
-        editLat.setText(formatCoord(lat));
-        editLng.setText(formatCoord(lng));
-        mapView.setLocation(lat, lng);
+        editCountryIso.setText(snapshot.isoCountry);
+        editMcc.setText(snapshot.mcc);
+        editMnc.setText(snapshot.mnc);
+        editSimOperatorName.setText(snapshot.simOperatorName);
+        editNetworkOperatorName.setText(snapshot.networkOperatorName);
+        editTimezone.setText(snapshot.timezoneId);
+        editLocaleLanguage.setText(snapshot.localeLanguage());
+        editLocaleCountry.setText(snapshot.localeCountry());
+        editPhone.setText(snapshot.phoneNumber);
+        editLat.setText(formatCoord(snapshot.latitude));
+        editLng.setText(formatCoord(snapshot.longitude));
+        mapView.setLocation(snapshot.latitude, snapshot.longitude);
 
         for (HookCatalog.Hook hook : HookCatalog.allHooks()) {
             Switch sw = hookSwitches.get(hook.key);
-            if (sw != null) sw.setChecked(sp.getBoolean(hook.key, true));
+            if (sw != null) {
+                sw.setChecked(snapshot.isHookEnabled(hook.key));
+            }
         }
 
-        txtStatus.setText("Connected.");
+        txtStatus.setText(
+                status + " Config v" + snapshot.configVersion + ".");
         loading = false;
     }
 
-    private void saveAndApply() {
-        if (service == null || loading) return;
+    private boolean saveAndApply() {
+        if (service == null || loading) return false;
 
-        String isoCountry = editCountryIso.getText().toString().trim().toLowerCase(Locale.US);
+        ConfigSnapshot candidate;
+        try {
+            candidate = buildCandidateFromUi();
+        } catch (IllegalArgumentException ex) {
+            showValidationError(ex.getMessage());
+            return false;
+        }
+
+        ConfigSnapshot.ValidationResult validation = candidate.validate();
+        if (!validation.valid) {
+            showValidationError(validation.error);
+            return false;
+        }
+
+        ConfigStore.SaveResult result = ConfigStore.saveNext(
+                service.getRemotePreferences(ConfigKeys.GROUP),
+                candidate);
+        if (!result.success) {
+            showPersistenceError(result.error);
+            return false;
+        }
+
+        pendingSave = false;
+        String time =
+                new SimpleDateFormat("HH:mm:ss", Locale.US)
+                        .format(new Date());
+
+        StringBuilder status = new StringBuilder();
+        status.append("Saved config v")
+                .append(result.snapshot.configVersion)
+                .append(" at ")
+                .append(time)
+                .append(". Already-running target apps need a force-stop + reopen ")
+                .append("(or reboot) to pick this up.");
+        if (result.warning != null && !result.warning.isEmpty()) {
+            status.append(" Warning: ").append(result.warning);
+        }
+        txtStatus.setText(status.toString());
+        return true;
+    }
+
+    private ConfigSnapshot buildCandidateFromUi() {
+        String isoCountry =
+                editCountryIso.getText().toString().trim()
+                        .toLowerCase(Locale.US);
         String mcc = editMcc.getText().toString().trim();
         String mnc = editMnc.getText().toString().trim();
-        String simOperatorName = editSimOperatorName.getText().toString().trim();
-        String networkOperatorName = editNetworkOperatorName.getText().toString().trim();
-        String timezoneId = editTimezone.getText().toString().trim();
-        String localeLang = editLocaleLanguage.getText().toString().trim().toLowerCase(Locale.US);
-        String localeCountry = editLocaleCountry.getText().toString().trim().toUpperCase(Locale.US);
+        String simOperatorName =
+                editSimOperatorName.getText().toString().trim();
+        String networkOperatorName =
+                editNetworkOperatorName.getText().toString().trim();
+        String timezoneId =
+                editTimezone.getText().toString().trim();
+        String localeLanguage =
+                editLocaleLanguage.getText().toString().trim();
+        String localeCountry =
+                editLocaleCountry.getText().toString().trim();
         String phone = editPhone.getText().toString().trim();
-
-        if (!isoCountry.matches("[a-zA-Z]{2}")) {
-            showValidationError("Country ISO must be exactly two letters, e.g. us.");
-            return;
-        }
-        if (!mcc.matches("\\d{3}")) {
-            showValidationError("MCC must be exactly three digits.");
-            return;
-        }
-        if (!mnc.matches("\\d{2,3}")) {
-            showValidationError("MNC must be two or three digits.");
-            return;
-        }
-        if (localeLang.isEmpty()) {
-            showValidationError("Locale language cannot be empty.");
-            return;
-        }
-        if (!localeCountry.isEmpty() && !localeCountry.matches("[A-Za-z]{2}")) {
-            showValidationError("Locale country/region must be two letters, e.g. US.");
-            return;
-        }
-        try {
-            ZoneId.of(timezoneId);
-        } catch (DateTimeException ex) {
-            showValidationError("Invalid IANA time zone: " + timezoneId);
-            return;
-        }
 
         Double lat = parseOrNull(editLat.getText().toString());
         Double lng = parseOrNull(editLng.getText().toString());
-        if (lat == null || lat < -90.0 || lat > 90.0) {
-            showValidationError("Latitude must be between -90 and 90.");
-            return;
-        }
-        if (lng == null || lng < -180.0 || lng > 180.0) {
-            showValidationError("Longitude must be between -180 and 180.");
-            return;
+        if (lat == null || lng == null) {
+            throw new IllegalArgumentException(
+                    "Latitude and longitude must be valid numbers.");
         }
 
-        SharedPreferences.Editor e = service.getRemotePreferences(ConfigKeys.GROUP).edit();
-        e.putString(ConfigKeys.COUNTRY, isoCountry);
-        e.putString(ConfigKeys.MCC, mcc);
-        e.putString(ConfigKeys.MNC, mnc);
-        e.putString(ConfigKeys.SIM_OP_NAME, simOperatorName);
-        e.putString(ConfigKeys.NET_OP_NAME, networkOperatorName);
-        e.putString(ConfigKeys.TIMEZONE, timezoneId);
-        e.putString(ConfigKeys.LOCALE_LANG, localeLang);
-        e.putString(ConfigKeys.LOCALE_COUNTRY, localeCountry);
-        e.putString(ConfigKeys.PHONE, phone);
-        e.putFloat(ConfigKeys.LAT, lat.floatValue());
-        e.putFloat(ConfigKeys.LNG, lng.floatValue());
+        String localeTag;
+        try {
+            localeTag = ConfigSnapshot.normalizeLocaleTag(
+                    localeLanguage, localeCountry);
+        } catch (RuntimeException ex) {
+            throw new IllegalArgumentException(
+                    "Locale language/region is invalid.");
+        }
 
+        Map<String, Boolean> hooks = new LinkedHashMap<>();
         for (Map.Entry<String, Switch> entry : hookSwitches.entrySet()) {
-            e.putBoolean(entry.getKey(), entry.getValue().isChecked());
+            hooks.put(entry.getKey(), entry.getValue().isChecked());
         }
 
-        e.apply();
-        ConfigStore.bumpVersion(service.getRemotePreferences(ConfigKeys.GROUP));
-
-        String time = new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date());
-        txtStatus.setText("Saved at " + time + ". Already-running target apps need a manual "
-                + "force-stop + reopen (or reboot) to pick this up.");
+        return new ConfigSnapshot(
+                ConfigSnapshot.SCHEMA_VERSION,
+                0,
+                isoCountry,
+                mcc,
+                mnc,
+                simOperatorName,
+                networkOperatorName,
+                timezoneId,
+                localeTag,
+                phone,
+                lat,
+                lng,
+                hooks);
     }
 
     private void showValidationError(String message) {
-        txtStatus.setText("Not saved: " + message);
+        txtStatus.setText("Not saved — validation failed: " + message);
+    }
+
+    private void showPersistenceError(String message) {
+        txtStatus.setText("Not saved — persistence failed: " + message);
     }
 
     private static Double parseOrNull(String s) {
@@ -416,6 +507,17 @@ public class MainActivity extends AppCompatActivity implements PrivacyMaskApp.Se
         } catch (NumberFormatException | NullPointerException ex) {
             return null;
         }
+    }
+
+    private static boolean isFiniteCoordinatePair(Double lat, Double lng) {
+        return lat != null
+                && lng != null
+                && Double.isFinite(lat)
+                && Double.isFinite(lng)
+                && lat >= -90.0
+                && lat <= 90.0
+                && lng >= -180.0
+                && lng <= 180.0;
     }
 
     private static String formatCoord(double v) {
