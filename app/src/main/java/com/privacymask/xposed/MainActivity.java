@@ -48,7 +48,7 @@ public class MainActivity extends AppCompatActivity implements PrivacyMaskApp.Se
     private EditText editLat, editLng, editPhone;
     private ViewGroup hooksContainer;
     private final Map<String, Switch> hookSwitches = new LinkedHashMap<>();
-    private Button btnRandomize;
+    private Button btnApplyPreset, btnRandomize;
     private TextView txtStatus;
     private WorldMapView mapView;
 
@@ -93,6 +93,7 @@ public class MainActivity extends AppCompatActivity implements PrivacyMaskApp.Se
         editPhone = findViewById(R.id.editPhone);
         mapView = findViewById(R.id.mapView);
         hooksContainer = findViewById(R.id.hooksContainer);
+        btnApplyPreset = findViewById(R.id.btnApplyPreset);
         btnRandomize = findViewById(R.id.btnRandomize);
         txtStatus = findViewById(R.id.txtStatus);
 
@@ -106,6 +107,13 @@ public class MainActivity extends AppCompatActivity implements PrivacyMaskApp.Se
 
         buildHookSwitches();
         wireUpAutoSave();
+
+        btnApplyPreset.setOnClickListener(v -> {
+            int position = spinnerCountry.getSelectedItemPosition();
+            if (position < 0 || position >= profiles.size()) return;
+            applyProfileDefaults(profiles.get(position));
+            saveAndApply();
+        });
 
         btnRandomize.setOnClickListener(v -> {
             if (service == null) return;
@@ -211,18 +219,6 @@ public class MainActivity extends AppCompatActivity implements PrivacyMaskApp.Se
         editLng.addTextChangedListener(autoSaveWatcher);
         editPhone.addTextChangedListener(autoSaveWatcher);
 
-        spinnerCountry.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
-            @Override
-            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
-                if (loading || position < 0 || position >= profiles.size()) return;
-                applyProfileDefaults(profiles.get(position));
-                saveAndApply();
-            }
-
-            @Override
-            public void onNothingSelected(AdapterView<?> parent) {}
-        });
-
         CompoundButton.OnCheckedChangeListener toggleListener =
                 (buttonView, isChecked) -> { if (!loading) saveAndApply(); };
         for (Switch sw : hookSwitches.values()) {
@@ -278,6 +274,7 @@ public class MainActivity extends AppCompatActivity implements PrivacyMaskApp.Se
 
     private void setControlsEnabled(boolean enabled) {
         spinnerCountry.setEnabled(enabled);
+        btnApplyPreset.setEnabled(enabled);
         editCountryIso.setEnabled(enabled);
         editMcc.setEnabled(enabled);
         editMnc.setEnabled(enabled);
