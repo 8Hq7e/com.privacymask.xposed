@@ -361,28 +361,202 @@ public class PrivacyMaskModule extends XposedModule {
                 monitorClass.getDeclaredMethod("getInstance", long.class);
 
         hookSafe(() -> hook(getInstance).intercept(chain -> {
+            final long nativePtr = ((Number) chain.getArg(0)).longValue();
             Object instance = chain.proceed();
-            try {
-                java.lang.reflect.Field receiverField =
-                        monitorClass.getDeclaredField("mBroadcastReceiver");
-                receiverField.setAccessible(true);
-                Object receiverObject = receiverField.get(instance);
-                if (receiverObject instanceof BroadcastReceiver) {
-                    Intent fakeChange = new Intent(Intent.ACTION_TIMEZONE_CHANGED);
-                    fakeChange.putExtra(Intent.EXTRA_TIMEZONE, cfg.timezoneId);
-                    ((BroadcastReceiver) receiverObject).onReceive(null, fakeChange);
-                    log(Log.INFO, TAG,
-                            "Chromium TimeZoneMonitor injected " + cfg.timezoneId);
-                } else {
-                    log(Log.WARN, TAG,
-                            "Chromium TimeZoneMonitor receiver field type changed");
-                }
-            } catch (Throwable t) {
-                log(Log.WARN, TAG, "Chromium TimeZoneMonitor injection failed: " + t);
+
+            // Release Chrome is optimized/obfuscated, so private field names are not stable.
+            // Log the actual field layout we see and resolve the receiver by TYPE instead of
+            // relying on Chromium source names such as "mBroadcastReceiver".
+            logChromiumTimeZoneMonitorFieldLayout(monitorClass);
+
+            boolean injected = tryInjectChromiumTimezoneViaReceiver(
+                    monitorClass, instance, cfg.timezoneId);
+
+            // If R8 has inlined/reshaped the BroadcastReceiver field, bypass that Java detail
+            // entirely. The getInstance(long) argument is the native TimeZoneMonitorAndroid*
+            // pointer, and Chromium's generated JniZero bridge accepts exactly that pointer
+            // plus the IANA zone ID.
+            if (!injected) {
+                injected = tryInjectChromiumTimezoneViaJni(
+                        monitorClass, nativePtr, cfg.timezoneId);
+            }
+
+            if (injected) {
+                log(Log.INFO, TAG,
+                        "Chromium native timezone update sent: " + cfg.timezoneId);
+            } else {
+                log(Log.WARN, TAG,
+                        "Chromium timezone injection exhausted all Java/JNI paths");
             }
             return instance;
         }));
         log(Log.INFO, TAG, "Chromium TimeZoneMonitor target hook installed");
+    }
+
+    private void logChromiumTimeZoneMonitorFieldLayout(Class<?> monitorClass) {
+        try {
+            Class<?> current = monitorClass;
+            while (current != null && current != Object.class) {
+                java.lang.reflect.Field[] fields = current.getDeclaredFields();
+                if (fields.length == 0) {
+                    log(Log.INFO, TAG,
+                            "Chromium TimeZoneMonitor fields " + current.getName() + ": <none>");
+                } else {
+                    for (java.lang.reflect.Field field : fields) {
+                        log(Log.INFO, TAG,
+                                "Chromium TimeZoneMonitor field "
+                                        + current.getName() + "."
+                                        + field.getName() + " : "
+                                        + field.getType().getName());
+                    }
+                }
+                current = current.getSuperclass();
+            }
+        } catch (Throwable t) {
+            log(Log.WARN, TAG,
+                    "Chromium TimeZoneMonitor field-layout logging failed: " + t);
+        }
+    }
+
+    private boolean tryInjectChromiumTimezoneViaReceiver(
+            Class<?> monitorClass, Object instance, String timezoneId) {
+        try {
+            Class<?> current = monitorClass;
+            while (current != null && current != Object.class) {
+                for (java.lang.reflect.Field field : current.getDeclaredFields()) {
+                    if (!BroadcastReceiver.class.isAssignableFrom(field.getType())) {
+                        continue;
+                    }
+
+                    field.setAccessible(true);
+                    Object receiverObject = field.get(instance);
+                    if (!(receiverObject instanceof BroadcastReceiver)) {
+                        continue;
+                    }
+
+                    Intent fakeChange = new Intent(Intent.ACTION_TIMEZONE_CHANGED);
+                    fakeChange.putExtra(Intent.EXTRA_TIMEZONE, timezoneId);
+                    ((BroadcastReceiver) receiverObject).onReceive(null, fakeChange);
+
+                    log(Log.INFO, TAG,
+                            "Chromium TimeZoneMonitor receiver found by type: "
+                                    + field.getType().getName());
+                    log(Log.INFO, TAG,
+                            "Chromium TimeZoneMonitor synthetic timezone sent: "
+                                    + timezoneId);
+                    return true;
+                }
+                current = current.getSuperclass();
+            }
+
+            log(Log.INFO, TAG,
+                    "Chromium TimeZoneMonitor has no BroadcastReceiver-typed field; "
+                            + "trying JNI fallback");
+            return false;
+        } catch (Throwable t) {
+            log(Log.WARN, TAG,
+                    "Chromium TimeZoneMonitor receiver injection failed: " + t
+                            + "; trying JNI fallback");
+            return false;
+        }
+    }
+
+    private boolean tryInjectChromiumTimezoneViaJni(
+            Class<?> monitorClass, long nativePtr, String timezoneId) {
+        ClassLoader loader = monitorClass.getClassLoader();
+        String jniClassName = monitorClass.getName() + "Jni";
+
+        try {
+            Class<?> jniClass = Class.forName(jniClassName, false, loader);
+            java.lang.reflect.Method getMethod = null;
+            for (java.lang.reflect.Method method : jniClass.getDeclaredMethods()) {
+                if (java.lang.reflect.Modifier.isStatic(method.getModifiers())
+                        && method.getParameterCount() == 0
+                        && "get".equals(method.getName())) {
+                    getMethod = method;
+                    break;
+                }
+            }
+            if (getMethod == null) {
+                log(Log.WARN, TAG,
+                        "Chromium JNI fallback: no static get() on " + jniClassName);
+                return false;
+            }
+
+            getMethod.setAccessible(true);
+            Object natives = getMethod.invoke(null);
+            if (natives == null) {
+                log(Log.WARN, TAG,
+                        "Chromium JNI fallback: " + jniClassName + ".get() returned null");
+                return false;
+            }
+
+            java.lang.reflect.Method timezoneMethod =
+                    findChromiumTimezoneChangedMethod(natives.getClass());
+            if (timezoneMethod == null) {
+                // Some generated implementations expose the method only through the nested
+                // Natives interface. Search that interface by signature rather than by its
+                // source-level name so this remains resilient to obfuscation.
+                for (Class<?> nested : monitorClass.getDeclaredClasses()) {
+                    java.lang.reflect.Method candidate =
+                            findChromiumTimezoneChangedMethod(nested);
+                    if (candidate != null) {
+                        timezoneMethod = candidate;
+                        break;
+                    }
+                }
+            }
+
+            if (timezoneMethod == null) {
+                log(Log.WARN, TAG,
+                        "Chromium JNI fallback: no (long,String)->void timezone method found");
+                return false;
+            }
+
+            timezoneMethod.setAccessible(true);
+            timezoneMethod.invoke(natives, nativePtr, timezoneId);
+            log(Log.INFO, TAG,
+                    "Chromium TimeZoneMonitor JNI fallback invoked via "
+                            + jniClassName + " using nativePtr=" + nativePtr);
+            return true;
+        } catch (ClassNotFoundException e) {
+            log(Log.WARN, TAG,
+                    "Chromium JNI fallback class not found: " + jniClassName);
+            return false;
+        } catch (Throwable t) {
+            log(Log.WARN, TAG,
+                    "Chromium TimeZoneMonitor JNI fallback failed: " + t);
+            return false;
+        }
+    }
+
+    private java.lang.reflect.Method findChromiumTimezoneChangedMethod(Class<?> type) {
+        try {
+            for (java.lang.reflect.Method method : type.getDeclaredMethods()) {
+                Class<?>[] params = method.getParameterTypes();
+                if (method.getReturnType() == void.class
+                        && params.length == 2
+                        && params[0] == long.class
+                        && params[1] == String.class) {
+                    return method;
+                }
+            }
+
+            for (java.lang.reflect.Method method : type.getMethods()) {
+                Class<?>[] params = method.getParameterTypes();
+                if (method.getReturnType() == void.class
+                        && params.length == 2
+                        && params[0] == long.class
+                        && params[1] == String.class) {
+                    return method;
+                }
+            }
+        } catch (Throwable t) {
+            log(Log.WARN, TAG,
+                    "Chromium JNI method-signature scan failed for "
+                            + type.getName() + ": " + t);
+        }
+        return null;
     }
 
     private void unhookQuietly(HookHandle[] handles) {
