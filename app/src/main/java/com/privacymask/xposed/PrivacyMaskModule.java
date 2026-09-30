@@ -68,7 +68,7 @@ public class PrivacyMaskModule extends XposedModule {
 
         try {
             FakeConfig cfg = FakeConfig.from(this);
-            applyAllHooks(cfg);
+            applyAllHooks(cfg, param.getClassLoader());
             log(Log.INFO, TAG, "applied fake identity [" + cfg.isoCountry + "] to "
                     + packageName + " (config v" + cfg.version + ")");
         } catch (Throwable t) {
@@ -76,14 +76,14 @@ public class PrivacyMaskModule extends XposedModule {
         }
     }
 
-    private void applyAllHooks(FakeConfig cfg) {
+    private void applyAllHooks(FakeConfig cfg, ClassLoader appClassLoader) {
         // Every hookXxx() method below now checks each individual hook's own switch (see
         // ConfigKeys.HOOK_* / HookCatalog), so all six groups are always visited here; whether
         // any given Android API actually gets intercepted depends entirely on that hook's flag.
         hookTelephony(cfg);
         hookSubscriptionInfo(cfg);
         hookLocation(cfg);
-        hookTimeZone(cfg);
+        hookTimeZone(cfg, appClassLoader);
         hookLocale(cfg);
         hookSystemProperties(cfg);
     }
@@ -224,18 +224,45 @@ public class PrivacyMaskModule extends XposedModule {
     // -----------------------------------------------------------------
     // Timezone
     // -----------------------------------------------------------------
-    private void hookTimeZone(FakeConfig cfg) {
+    private void hookTimeZone(FakeConfig cfg, ClassLoader appClassLoader) {
         if (cfg.isHookEnabled(ConfigKeys.HOOK_TZ_DEFAULT)) {
+            final TimeZone fakeTimeZone = TimeZone.getTimeZone(cfg.timezoneId);
             hookSafe(() -> hook(TimeZone.class.getDeclaredMethod("getDefault"))
-                    .intercept(chain -> TimeZone.getTimeZone(cfg.timezoneId)));
+                    .intercept(chain -> fakeTimeZone));
+
+            // Android also exposes ICU directly. Apps using android.icu.* bypass
+            // java.util.TimeZone, so keep that layer consistent too.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                final android.icu.util.TimeZone fakeIcuTimeZone =
+                        android.icu.util.TimeZone.getTimeZone(cfg.timezoneId);
+                hookSafe(() -> hook(android.icu.util.TimeZone.class.getDeclaredMethod("getDefault"))
+                        .intercept(chain -> fakeIcuTimeZone));
+            }
+
+            // Chromium seeds its native/V8 timezone through this Java bridge on Android.
+            // Hook it when present; non-Chromium apps simply won't have the class and are
+            // unaffected. This is intentionally best-effort because Chromium package builds
+            // may move or remove the bridge across versions.
+            if (appClassLoader != null) {
+                try {
+                    Class<?> timezoneUtils =
+                            Class.forName("org.chromium.base.TimezoneUtils", false, appClassLoader);
+                    java.lang.reflect.Method chromiumGetDefaultTimeZoneId =
+                            timezoneUtils.getDeclaredMethod("getDefaultTimeZoneId");
+                    hookSafe(() -> hook(chromiumGetDefaultTimeZoneId)
+                            .intercept(chain -> cfg.timezoneId));
+                    log(Log.INFO, TAG, "Chromium TimezoneUtils hook installed");
+                } catch (ClassNotFoundException | NoSuchMethodException ignored) {
+                    // Expected for non-Chromium apps and Chromium builds that use another path.
+                } catch (Throwable t) {
+                    log(Log.WARN, TAG, "Chromium timezone hook unavailable: " + t);
+                }
+            }
         }
 
         // java.time never asks TimeZone for anything — ZoneId.systemDefault() reads the
         // default zone independently, and everything downstream (ZonedDateTime.now(),
-        // DateTimeFormatter "zzz"/"zzzz" patterns, etc.) derives from whatever it returns. So
-        // without this hook, the modern java.time.* APIs leak the real zone even while
-        // TimeZone.getDefault() above is faked. It's a separate switch precisely because it's
-        // a separate call path.
+        // DateTimeFormatter "zzz"/"zzzz" patterns, etc.) derives from whatever it returns.
         if (cfg.isHookEnabled(ConfigKeys.HOOK_TZ_ZONEID) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             final ZoneId fakeZoneId = ZoneId.of(cfg.timezoneId);
             hookSafe(() -> hook(ZoneId.class.getDeclaredMethod("systemDefault"))
