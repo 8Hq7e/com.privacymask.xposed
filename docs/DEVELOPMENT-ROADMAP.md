@@ -198,8 +198,10 @@ Do not infer installed-binary identity merely from source HEAD.
 **Target version: 1.2.4**
 
 **Implementation status:** implemented on `master` as 1.2.4 / versionCode 7. GitHub Actions
-debug build #29 completed successfully. Runtime exit-condition verification on WSA and Xiaomi is
-still required before Phase 1 is marked accepted.
+debug build #29 completed successfully. WSA Chrome regression subsequently passed: Chromium
+reached `HOOKED`, the native time-zone update was sent successfully, and a non-target privileged
+process observer expired at the 30-second bound as designed. Xiaomi and generic non-Chromium
+runtime verification remain required before Phase 1 is fully accepted.
 
 This phase must not expand the spoofing surface. Its job is to make existing behavior safer and
 more deterministic.
@@ -290,6 +292,13 @@ Also test concurrent reads.
 # 7. Phase 2 — Atomic configuration model
 
 **Target version: 1.3.0**
+
+**Implementation status:** implemented on `master` as 1.3.0 / versionCode 8. Schema v2 stores
+identity fields, hook flags and configVersion as one authoritative JSON value. Legacy 1.2.x keys
+are read only for one-time migration. Fresh installs use one deterministic default profile and
+randomization is explicit-only. UI debounce is flushed on Activity stop; validation distinguishes
+invalid input from persistence failure and surfaces consistency warnings. Runtime migration and
+multi-process same-configVersion verification are still required before Phase 2 is accepted.
 
 Configuration correctness is a privacy requirement. Different target processes must not obtain
 mixed identities.
