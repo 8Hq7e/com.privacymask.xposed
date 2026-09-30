@@ -27,7 +27,8 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginTop="16dp"
-            android:text="Fake identity country:" />
+            android:text="Identity preset:"
+            android:textStyle="bold" />
 
         <Spinner
             android:id="@+id/spinnerCountry"
@@ -37,8 +38,123 @@
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
-            android:text="Fake location — drag the pin, or edit the numbers below:" />
+            android:layout_marginTop="8dp"
+            android:text="Selecting a preset fills the fields below. Every field remains editable and the saved custom values are authoritative."
+            android:textSize="12sp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:text="Custom identity values"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Country ISO (lowercase, e.g. us):" />
+        <EditText
+            android:id="@+id/editCountryIso"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:inputType="textNoSuggestions"
+            android:maxLines="1" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="MCC:" />
+        <EditText
+            android:id="@+id/editMcc"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:inputType="number"
+            android:maxLines="1" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="MNC:" />
+        <EditText
+            android:id="@+id/editMnc"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:inputType="number"
+            android:maxLines="1" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="SIM operator name:" />
+        <EditText
+            android:id="@+id/editSimOperatorName"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:inputType="text"
+            android:maxLines="1" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Network operator name:" />
+        <EditText
+            android:id="@+id/editNetworkOperatorName"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:inputType="text"
+            android:maxLines="1" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Time zone (IANA ID, e.g. America/Los_Angeles):" />
+        <EditText
+            android:id="@+id/editTimezone"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:inputType="textNoSuggestions"
+            android:maxLines="1" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Locale language (e.g. en):" />
+        <EditText
+            android:id="@+id/editLocaleLanguage"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:inputType="textNoSuggestions"
+            android:maxLines="1" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Locale country/region (e.g. US):" />
+        <EditText
+            android:id="@+id/editLocaleCountry"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:inputType="textNoSuggestions"
+            android:maxLines="1" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Fake phone number:" />
+        <EditText
+            android:id="@+id/editPhone"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:inputType="phone"
+            android:maxLines="1" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:text="Fake location — drag the pin, or edit the numbers below:"
+            android:textStyle="bold" />
 
         <com.privacymask.xposed.WorldMapView
             android:id="@+id/mapView"
@@ -55,7 +171,8 @@
             android:id="@+id/editLat"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:inputType="numberDecimal|numberSigned" />
+            android:inputType="numberDecimal|numberSigned"
+            android:maxLines="1" />
 
         <TextView
             android:layout_width="wrap_content"
@@ -65,17 +182,8 @@
             android:id="@+id/editLng"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:inputType="numberDecimal|numberSigned" />
-
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="Fake phone number:" />
-        <EditText
-            android:id="@+id/editPhone"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:inputType="phone" />
+            android:inputType="numberDecimal|numberSigned"
+            android:maxLines="1" />
 
         <Button
             android:id="@+id/btnRandomize"
@@ -97,8 +205,6 @@
             android:text="Hooks — choose which of these get faked:"
             android:textStyle="bold" />
 
-        <!-- Filled programmatically in MainActivity: one Switch per individual hook (see
-             HookCatalog), with a bold header TextView above each group. -->
         <LinearLayout
             android:id="@+id/hooksContainer"
             android:layout_width="match_parent"
