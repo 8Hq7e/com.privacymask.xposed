@@ -22,10 +22,6 @@ jobs:
     permissions:
       contents: read
 
-    env:
-      ANDROID_HOME: /usr/local/lib/android/sdk
-      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -36,13 +32,19 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      - name: Set up current Android command-line tools
+        uses: android-actions/setup-android@v3
+        with:
+          accept-android-sdk-licenses: false
+          packages: ""
+
       - name: Accept Android SDK licenses
         run: |
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          yes | sdkmanager --licenses > /dev/null || true
 
       - name: Install Android SDK 37
         run: |
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+          sdkmanager \
             "platform-tools" \
             "platforms;android-37" \
             "build-tools;37.0.0"
