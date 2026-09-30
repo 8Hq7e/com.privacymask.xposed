@@ -389,8 +389,16 @@ public class MainActivity extends AppCompatActivity
             }
         }
 
-        txtStatus.setText(
-                status + " Config v" + snapshot.configVersion + ".");
+        ConfigSnapshot.ValidationResult validation = snapshot.validate();
+        StringBuilder loadedStatus = new StringBuilder();
+        loadedStatus.append(status)
+                .append(" Config v")
+                .append(snapshot.configVersion)
+                .append(".");
+        if (validation.warning != null && !validation.warning.isEmpty()) {
+            loadedStatus.append(" Warning: ").append(validation.warning);
+        }
+        txtStatus.setText(loadedStatus.toString());
         loading = false;
     }
 
