@@ -42,12 +42,18 @@ jobs:
         run: |
           yes | sdkmanager --licenses > /dev/null || true
 
-      - name: Install Android SDK 36
+      - name: Install Android SDK 37.0
         run: |
-          sdkmanager \
+                    sdkmanager --channel=3 \
             "platform-tools" \
-            "platforms;android-36" \
-            "build-tools;36.0.0"
+            "platforms;android-37.0" \
+            "build-tools;37.0.0"
+
+      - name: Add API 37 compatibility alias
+        run: |
+          if [ -d "$ANDROID_HOME/platforms/android-37.0" ] && [ ! -e "$ANDROID_HOME/platforms/android-37" ]; then
+            ln -s "$ANDROID_HOME/platforms/android-37.0" "$ANDROID_HOME/platforms/android-37"
+          fi
 
       - name: Make Gradle executable
         run: chmod +x gradlew
