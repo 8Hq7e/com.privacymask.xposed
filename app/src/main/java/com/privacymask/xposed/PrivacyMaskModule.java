@@ -15,6 +15,9 @@ import android.util.Log;
 import java.time.ZoneId;
 import java.util.Locale;
 import java.util.TimeZone;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import io.github.libxposed.api.XposedInterface.HookHandle;
 
 import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
@@ -260,48 +263,12 @@ public class PrivacyMaskModule extends XposedModule {
 
                 // Current Chromium propagates host timezone changes through
                 // org.chromium.device.time_zone_monitor.TimeZoneMonitor into native ICU,
-                // then notifies renderer processes, V8 and workers. After Chromium creates
-                // its monitor, inject one synthetic ACTION_TIMEZONE_CHANGED event directly
-                // into its own registered receiver. No protected broadcast is sent to the OS;
-                // we invoke the receiver instance in-process so Chromium follows its normal
-                // native update path with our configured IANA timezone.
-                try {
-                    Class<?> monitorClass = Class.forName(
-                            "org.chromium.device.time_zone_monitor.TimeZoneMonitor",
-                            false,
-                            appClassLoader);
-                    java.lang.reflect.Method getInstance =
-                            monitorClass.getDeclaredMethod("getInstance", long.class);
-                    hookSafe(() -> hook(getInstance).intercept(chain -> {
-                        Object instance = chain.proceed();
-                        try {
-                            java.lang.reflect.Field receiverField =
-                                    monitorClass.getDeclaredField("mBroadcastReceiver");
-                            receiverField.setAccessible(true);
-                            Object receiverObject = receiverField.get(instance);
-                            if (receiverObject instanceof BroadcastReceiver) {
-                                Intent fakeChange = new Intent(Intent.ACTION_TIMEZONE_CHANGED);
-                                fakeChange.putExtra(Intent.EXTRA_TIMEZONE, cfg.timezoneId);
-                                ((BroadcastReceiver) receiverObject).onReceive(null, fakeChange);
-                                log(Log.INFO, TAG,
-                                        "Chromium TimeZoneMonitor injected " + cfg.timezoneId);
-                            } else {
-                                log(Log.WARN, TAG,
-                                        "Chromium TimeZoneMonitor receiver field type changed");
-                            }
-                        } catch (Throwable t) {
-                            log(Log.WARN, TAG,
-                                    "Chromium TimeZoneMonitor injection failed: " + t);
-                        }
-                        return instance;
-                    }));
-                    log(Log.INFO, TAG, "Chromium TimeZoneMonitor hook installed");
-                } catch (ClassNotFoundException | NoSuchMethodException e) {
-                    log(Log.INFO, TAG,
-                            "Chromium TimeZoneMonitor class not present in this process");
-                } catch (Throwable t) {
-                    log(Log.WARN, TAG,
-                            "Chromium TimeZoneMonitor hook unavailable: " + t);
+                // then notifies renderer processes, V8 and workers. Chrome loads that class
+                // from a later split ClassLoader on some builds, so first try immediately and
+                // otherwise arm a temporary ClassLoader observer that installs the hook the
+                // instant the class becomes visible.
+                if (!tryInstallChromiumTimeZoneMonitorHook(appClassLoader, cfg)) {
+                    installDeferredChromiumTimeZoneMonitorHook(cfg);
                 }
             }
         }
@@ -313,6 +280,119 @@ public class PrivacyMaskModule extends XposedModule {
             final ZoneId fakeZoneId = ZoneId.of(cfg.timezoneId);
             hookSafe(() -> hook(ZoneId.class.getDeclaredMethod("systemDefault"))
                     .intercept(chain -> fakeZoneId));
+        }
+    }
+
+
+    /**
+     * Installs the Chromium TimeZoneMonitor hook if the class is already visible to the given
+     * loader. Returns true once the target hook is installed.
+     */
+    private boolean tryInstallChromiumTimeZoneMonitorHook(ClassLoader loader, FakeConfig cfg) {
+        if (loader == null) return false;
+        try {
+            Class<?> monitorClass = Class.forName(
+                    "org.chromium.device.time_zone_monitor.TimeZoneMonitor",
+                    false,
+                    loader);
+            installChromiumTimeZoneMonitorHook(monitorClass, cfg);
+            return true;
+        } catch (ClassNotFoundException e) {
+            log(Log.INFO, TAG,
+                    "Chromium TimeZoneMonitor class not present yet; arming deferred loader hook");
+            return false;
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "Chromium TimeZoneMonitor hook unavailable: " + t);
+            return false;
+        }
+    }
+
+    /**
+     * Watches ClassLoader.loadClass only until Chromium's TimeZoneMonitor appears. This is
+     * needed for modern Chrome builds that install/load parts of Chromium from split APKs
+     * after onPackageReady().
+     */
+    private void installDeferredChromiumTimeZoneMonitorHook(FakeConfig cfg) {
+        final String target =
+                "org.chromium.device.time_zone_monitor.TimeZoneMonitor";
+        final AtomicBoolean installed = new AtomicBoolean(false);
+        final HookHandle[] handles = new HookHandle[2];
+
+        try {
+            java.lang.reflect.Method loadClassOne =
+                    ClassLoader.class.getDeclaredMethod("loadClass", String.class);
+            java.lang.reflect.Method loadClassTwo =
+                    ClassLoader.class.getDeclaredMethod("loadClass", String.class, boolean.class);
+
+            handles[0] = hook(loadClassOne).intercept(chain -> {
+                Object result = chain.proceed();
+                if (result instanceof Class<?> && target.equals(((Class<?>) result).getName())
+                        && installed.compareAndSet(false, true)) {
+                    installChromiumTimeZoneMonitorHook((Class<?>) result, cfg);
+                    unhookQuietly(handles);
+                    log(Log.INFO, TAG,
+                            "Chromium TimeZoneMonitor deferred hook installed from loadClass(String)");
+                }
+                return result;
+            });
+
+            handles[1] = hook(loadClassTwo).intercept(chain -> {
+                Object result = chain.proceed();
+                if (result instanceof Class<?> && target.equals(((Class<?>) result).getName())
+                        && installed.compareAndSet(false, true)) {
+                    installChromiumTimeZoneMonitorHook((Class<?>) result, cfg);
+                    unhookQuietly(handles);
+                    log(Log.INFO, TAG,
+                            "Chromium TimeZoneMonitor deferred hook installed from loadClass(String,boolean)");
+                }
+                return result;
+            });
+
+            log(Log.INFO, TAG, "Chromium TimeZoneMonitor deferred loader observer armed");
+        } catch (Throwable t) {
+            unhookQuietly(handles);
+            log(Log.WARN, TAG, "Chromium deferred loader observer failed: " + t);
+        }
+    }
+
+    private void installChromiumTimeZoneMonitorHook(Class<?> monitorClass, FakeConfig cfg)
+            throws NoSuchMethodException {
+        java.lang.reflect.Method getInstance =
+                monitorClass.getDeclaredMethod("getInstance", long.class);
+
+        hookSafe(() -> hook(getInstance).intercept(chain -> {
+            Object instance = chain.proceed();
+            try {
+                java.lang.reflect.Field receiverField =
+                        monitorClass.getDeclaredField("mBroadcastReceiver");
+                receiverField.setAccessible(true);
+                Object receiverObject = receiverField.get(instance);
+                if (receiverObject instanceof BroadcastReceiver) {
+                    Intent fakeChange = new Intent(Intent.ACTION_TIMEZONE_CHANGED);
+                    fakeChange.putExtra(Intent.EXTRA_TIMEZONE, cfg.timezoneId);
+                    ((BroadcastReceiver) receiverObject).onReceive(null, fakeChange);
+                    log(Log.INFO, TAG,
+                            "Chromium TimeZoneMonitor injected " + cfg.timezoneId);
+                } else {
+                    log(Log.WARN, TAG,
+                            "Chromium TimeZoneMonitor receiver field type changed");
+                }
+            } catch (Throwable t) {
+                log(Log.WARN, TAG, "Chromium TimeZoneMonitor injection failed: " + t);
+            }
+            return instance;
+        }));
+        log(Log.INFO, TAG, "Chromium TimeZoneMonitor target hook installed");
+    }
+
+    private void unhookQuietly(HookHandle[] handles) {
+        if (handles == null) return;
+        for (HookHandle handle : handles) {
+            if (handle == null) continue;
+            try {
+                handle.unhook();
+            } catch (Throwable ignored) {
+            }
         }
     }
 
