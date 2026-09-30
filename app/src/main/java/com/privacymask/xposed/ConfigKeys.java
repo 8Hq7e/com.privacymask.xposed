@@ -13,6 +13,10 @@ public final class ConfigKeys {
     /** Remote-preferences group name. */
     public static final String GROUP = "privacymask_config";
 
+    /** Authoritative schema-v2+ configuration snapshot. */
+    public static final String SNAPSHOT_JSON = "config_snapshot_json";
+
+    // Legacy schema-v1 keys retained only for one-time migration from PrivacyMask 1.2.x.
     public static final String COUNTRY = "iso_country";
     public static final String MCC = "mcc";
     public static final String MNC = "mnc";
@@ -24,7 +28,7 @@ public final class ConfigKeys {
     public static final String PHONE = "phone_number";
     public static final String LAT = "latitude";
     public static final String LNG = "longitude";
-    public static final String VERSION = "config_version"; // bumped on every save
+    public static final String VERSION = "config_version"; // legacy migration source only
 
     // Per-hook on/off switches — one per individual hook() call PrivacyMaskModule installs,
     // NOT one per group. Which apps get hooked at all is entirely up to the framework's own
