@@ -70,7 +70,7 @@ public final class HookCatalog {
                     new Hook(ConfigKeys.HOOK_LOC_LAST_KNOWN, "Last known location (LocationManager.getLastKnownLocation)")
             ),
             new Group("Time zone",
-                    new Hook(ConfigKeys.HOOK_TZ_DEFAULT, "Default zone (TimeZone.getDefault)"),
+                    new Hook(ConfigKeys.HOOK_TZ_DEFAULT, "Default zone (java.util / Android ICU / Chromium)"),
                     new Hook(ConfigKeys.HOOK_TZ_ZONEID, "System default zone (ZoneId.systemDefault)")
             ),
             new Group("Locale",
