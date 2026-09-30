@@ -4,12 +4,12 @@ plugins {
 
 android {
     namespace 'com.privacymask.xposed'
-    compileSdk 36
+    compileSdk 37
 
     defaultConfig {
         applicationId 'com.privacymask.xposed'
         minSdk 26
-        targetSdk 36
+        targetSdk 37
         versionCode 2
         versionName '1.1.0'
     }
