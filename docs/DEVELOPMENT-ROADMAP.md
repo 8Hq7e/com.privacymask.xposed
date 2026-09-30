@@ -197,6 +197,10 @@ Do not infer installed-binary identity merely from source HEAD.
 
 **Target version: 1.2.4**
 
+**Implementation status:** implemented on `master` as 1.2.4 / versionCode 7. GitHub Actions
+debug build #29 completed successfully. Runtime exit-condition verification on WSA and Xiaomi is
+still required before Phase 1 is marked accepted.
+
 This phase must not expand the spoofing surface. Its job is to make existing behavior safer and
 more deterministic.
 
