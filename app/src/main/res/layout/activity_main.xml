@@ -35,11 +35,17 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content" />
 
+        <Button
+            android:id="@+id/btnApplyPreset"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Apply selected preset" />
+
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
-            android:text="Selecting a preset fills the fields below. Every field remains editable and the saved custom values are authoritative."
+            android:text="A preset changes values only when you tap Apply. Every field remains editable and saved custom values are authoritative."
             android:textSize="12sp" />
 
         <TextView
