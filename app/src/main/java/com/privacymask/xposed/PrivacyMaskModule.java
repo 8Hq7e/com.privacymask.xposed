@@ -15,8 +15,6 @@ import android.util.Log;
 import java.time.ZoneId;
 import java.util.Locale;
 import java.util.TimeZone;
-import java.util.concurrent.atomic.AtomicBoolean;
-
 import io.github.libxposed.api.XposedInterface.HookHandle;
 
 import io.github.libxposed.api.XposedModule;
@@ -44,9 +42,33 @@ public class PrivacyMaskModule extends XposedModule {
     private static final String TAG = "PrivacyMask";
     private static final String SELF_PACKAGE = "com.privacymask.xposed";
 
+    private static final String CHROMIUM_TIMEZONE_MONITOR =
+            "org.chromium.device.time_zone_monitor.TimeZoneMonitor";
+    private static final int CHROMIUM_LOADER_MAX_CLASS_LOADS = 20_000;
+    private static final long CHROMIUM_LOADER_MAX_AGE_MS = 30_000L;
+
+    private enum ChromiumAdapterState {
+        UNARMED,
+        ARMED,
+        HOOKED,
+        FAILED,
+        EXPIRED
+    }
+
+    // XposedModule is process-local. These fields therefore track Chromium/WebView adapter
+    // state for one target process only.
+    private final Object chromiumAdapterLock = new Object();
+    private ChromiumAdapterState chromiumAdapterState = ChromiumAdapterState.UNARMED;
+    private HookHandle[] chromiumLoaderObserverHandles;
+    private HookHandle chromiumWebViewTriggerHandle;
+    private HookHandle chromiumTargetHookHandle;
+    private long chromiumObserverStartedAtMs;
+    private int chromiumObservedClassLoads;
+
     // System packages that must never be hooked, even if a user mistakenly adds them to
     // scope in the framework Manager — hooking these can destabilize the whole device.
     private static final String[] ALWAYS_EXCLUDED = {
+            "system",
             "android",
             "com.android.systemui",
             "com.android.phone",
@@ -66,14 +88,18 @@ public class PrivacyMaskModule extends XposedModule {
         final String packageName = param.getPackageName();
 
         for (String excluded : ALWAYS_EXCLUDED) {
-            if (excluded.equals(packageName)) return;
+            if (excluded.equals(packageName)) {
+                log(Log.INFO, TAG,
+                        "skipping protected package/process scope " + packageName);
+                return;
+            }
         }
         // Only hook once per process, on the process's main package.
         if (!param.isFirstPackage()) return;
 
         try {
             FakeConfig cfg = FakeConfig.from(this);
-            applyAllHooks(cfg, param.getClassLoader());
+            applyAllHooks(cfg, param.getClassLoader(), packageName);
             log(Log.INFO, TAG, "applied fake identity [" + cfg.isoCountry + "] to "
                     + packageName + " (config v" + cfg.version + ")");
         } catch (Throwable t) {
@@ -81,14 +107,15 @@ public class PrivacyMaskModule extends XposedModule {
         }
     }
 
-    private void applyAllHooks(FakeConfig cfg, ClassLoader appClassLoader) {
+    private void applyAllHooks(
+            FakeConfig cfg, ClassLoader appClassLoader, String packageName) {
         // Every hookXxx() method below now checks each individual hook's own switch (see
         // ConfigKeys.HOOK_* / HookCatalog), so all six groups are always visited here; whether
         // any given Android API actually gets intercepted depends entirely on that hook's flag.
         hookTelephony(cfg);
         hookSubscriptionInfo(cfg);
         hookLocation(cfg);
-        hookTimeZone(cfg, appClassLoader);
+        hookTimeZone(cfg, appClassLoader, packageName);
         hookLocale(cfg);
         hookSystemProperties(cfg);
     }
@@ -229,46 +256,40 @@ public class PrivacyMaskModule extends XposedModule {
     // -----------------------------------------------------------------
     // Timezone
     // -----------------------------------------------------------------
-    private void hookTimeZone(FakeConfig cfg, ClassLoader appClassLoader) {
+    private void hookTimeZone(
+            FakeConfig cfg, ClassLoader appClassLoader, String packageName) {
         if (cfg.isHookEnabled(ConfigKeys.HOOK_TZ_DEFAULT)) {
-            final TimeZone fakeTimeZone = TimeZone.getTimeZone(cfg.timezoneId);
+            // Android returns independent mutable TimeZone objects from getDefault(). Returning
+            // one shared fake instance lets a caller mutate PrivacyMask's process-wide result.
+            // Keep an internal template, but clone it for every intercepted call.
+            final TimeZone fakeTimeZoneTemplate = TimeZone.getTimeZone(cfg.timezoneId);
             hookSafe(() -> hook(TimeZone.class.getDeclaredMethod("getDefault"))
-                    .intercept(chain -> fakeTimeZone));
+                    .intercept(chain -> (TimeZone) fakeTimeZoneTemplate.clone()));
 
-            // Android also exposes ICU directly. Apps using android.icu.* bypass
-            // java.util.TimeZone, so keep that layer consistent too.
+            // ICU has the same mutable-object concern. cloneAsThawed() preserves the configured
+            // zone while ensuring callers cannot mutate the template used by later callers.
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                final android.icu.util.TimeZone fakeIcuTimeZone =
+                final android.icu.util.TimeZone fakeIcuTimeZoneTemplate =
                         android.icu.util.TimeZone.getTimeZone(cfg.timezoneId);
                 hookSafe(() -> hook(android.icu.util.TimeZone.class.getDeclaredMethod("getDefault"))
-                        .intercept(chain -> fakeIcuTimeZone));
+                        .intercept(chain -> fakeIcuTimeZoneTemplate.cloneAsThawed()));
             }
 
-            // Older Chromium builds seeded ICU through org.chromium.base.TimezoneUtils.
-            // Keep this best-effort hook for compatibility.
             if (appClassLoader != null) {
-                try {
-                    Class<?> timezoneUtils =
-                            Class.forName("org.chromium.base.TimezoneUtils", false, appClassLoader);
-                    java.lang.reflect.Method chromiumGetDefaultTimeZoneId =
-                            timezoneUtils.getDeclaredMethod("getDefaultTimeZoneId");
-                    hookSafe(() -> hook(chromiumGetDefaultTimeZoneId)
-                            .intercept(chain -> cfg.timezoneId));
-                    log(Log.INFO, TAG, "Chromium TimezoneUtils hook installed");
-                } catch (ClassNotFoundException | NoSuchMethodException ignored) {
-                    // Expected on current Chromium builds.
-                } catch (Throwable t) {
-                    log(Log.WARN, TAG, "Chromium TimezoneUtils hook unavailable: " + t);
-                }
+                installLegacyChromiumTimezoneUtilsHook(appClassLoader, cfg);
 
-                // Current Chromium propagates host timezone changes through
-                // org.chromium.device.time_zone_monitor.TimeZoneMonitor into native ICU,
-                // then notifies renderer processes, V8 and workers. Chrome loads that class
-                // from a later split ClassLoader on some builds, so first try immediately and
-                // otherwise arm a temporary ClassLoader observer that installs the hook the
-                // instant the class becomes visible.
+                // Never place ClassLoader.loadClass() observers in every scoped process. First
+                // try the target immediately. If it is not visible, only arm the bounded loader
+                // observer for a process that already looks Chromium-based. Generic Apps get a
+                // cold WebViewFactory trigger instead; the hot ClassLoader observer is armed
+                // only if/when that App actually initializes Android WebView.
                 if (!tryInstallChromiumTimeZoneMonitorHook(appClassLoader, cfg)) {
-                    installDeferredChromiumTimeZoneMonitorHook(cfg);
+                    if (isLikelyChromiumProcess(packageName, appClassLoader)) {
+                        armChromiumDeferredLoaderObserver(
+                                cfg, "Chromium candidate " + packageName);
+                    } else {
+                        installWebViewChromiumTrigger(cfg);
+                    }
                 }
             }
         }
@@ -284,83 +305,284 @@ public class PrivacyMaskModule extends XposedModule {
     }
 
 
-    /**
-     * Installs the Chromium TimeZoneMonitor hook if the class is already visible to the given
-     * loader. Returns true once the target hook is installed.
-     */
-    private boolean tryInstallChromiumTimeZoneMonitorHook(ClassLoader loader, FakeConfig cfg) {
-        if (loader == null) return false;
+    private void installLegacyChromiumTimezoneUtilsHook(
+            ClassLoader appClassLoader, FakeConfig cfg) {
         try {
-            Class<?> monitorClass = Class.forName(
-                    "org.chromium.device.time_zone_monitor.TimeZoneMonitor",
-                    false,
-                    loader);
-            installChromiumTimeZoneMonitorHook(monitorClass, cfg);
-            return true;
-        } catch (ClassNotFoundException e) {
-            log(Log.INFO, TAG,
-                    "Chromium TimeZoneMonitor class not present yet; arming deferred loader hook");
-            return false;
+            Class<?> timezoneUtils =
+                    Class.forName("org.chromium.base.TimezoneUtils", false, appClassLoader);
+            java.lang.reflect.Method chromiumGetDefaultTimeZoneId =
+                    timezoneUtils.getDeclaredMethod("getDefaultTimeZoneId");
+            HookHandle handle = hook(chromiumGetDefaultTimeZoneId)
+                    .intercept(chain -> cfg.timezoneId);
+            if (handle != null) {
+                log(Log.INFO, TAG, "Chromium TimezoneUtils hook installed");
+            }
+        } catch (ClassNotFoundException | NoSuchMethodException ignored) {
+            // Expected on current Chromium builds.
         } catch (Throwable t) {
-            log(Log.WARN, TAG, "Chromium TimeZoneMonitor hook unavailable: " + t);
-            return false;
+            log(Log.WARN, TAG, "Chromium TimezoneUtils hook unavailable: " + t);
         }
     }
 
     /**
-     * Watches ClassLoader.loadClass only until Chromium's TimeZoneMonitor appears. This is
-     * needed for modern Chrome builds that install/load parts of Chromium from split APKs
-     * after onPackageReady().
+     * Installs the Chromium TimeZoneMonitor hook if the class is already visible. Success is
+     * reported only when a real HookHandle has been returned.
      */
-    private void installDeferredChromiumTimeZoneMonitorHook(FakeConfig cfg) {
-        final String target =
-                "org.chromium.device.time_zone_monitor.TimeZoneMonitor";
-        final AtomicBoolean installed = new AtomicBoolean(false);
-        final HookHandle[] handles = new HookHandle[2];
+    private boolean tryInstallChromiumTimeZoneMonitorHook(ClassLoader loader, FakeConfig cfg) {
+        if (loader == null) return false;
+        try {
+            Class<?> monitorClass =
+                    Class.forName(CHROMIUM_TIMEZONE_MONITOR, false, loader);
+            HookHandle handle = installChromiumTimeZoneMonitorHook(monitorClass, cfg);
+            if (handle == null) return false;
 
+            synchronized (chromiumAdapterLock) {
+                chromiumTargetHookHandle = handle;
+                setChromiumAdapterStateLocked(
+                        ChromiumAdapterState.HOOKED,
+                        "TimeZoneMonitor already visible");
+                cleanupChromiumLoaderObserverLocked();
+                cleanupWebViewTriggerLocked();
+            }
+            return true;
+        } catch (ClassNotFoundException e) {
+            return false;
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "Chromium TimeZoneMonitor immediate hook unavailable: " + t);
+            return false;
+        }
+    }
+
+    private boolean isLikelyChromiumProcess(String packageName, ClassLoader loader) {
+        String normalized = packageName == null ? "" : packageName.toLowerCase(Locale.US);
+        if (normalized.contains("chrome")
+                || normalized.contains("chromium")
+                || normalized.contains("webview")) {
+            return true;
+        }
+
+        // Chromium forks typically keep at least one of these public-ish base classes even
+        // when their package name does not contain "chrome".
+        String[] markerClasses = {
+                "org.chromium.base.BuildInfo",
+                "org.chromium.base.ContextUtils",
+                "org.chromium.base.library_loader.LibraryLoader"
+        };
+        for (String marker : markerClasses) {
+            try {
+                Class.forName(marker, false, loader);
+                return true;
+            } catch (ClassNotFoundException ignored) {
+            } catch (Throwable t) {
+                log(Log.DEBUG, TAG,
+                        "Chromium marker probe failed for " + marker + ": " + t);
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Generic Apps should not carry a permanent ClassLoader hook just because time-zone masking
+     * is enabled. Instead, keep one cold trigger on WebViewFactory.getProvider(); if the App
+     * actually initializes Android WebView, arm the bounded Chromium loader observer *before*
+     * WebView provider loading proceeds.
+     */
+    private void installWebViewChromiumTrigger(FakeConfig cfg) {
+        synchronized (chromiumAdapterLock) {
+            if (chromiumAdapterState != ChromiumAdapterState.UNARMED
+                    || chromiumWebViewTriggerHandle != null) {
+                return;
+            }
+        }
+
+        try {
+            Class<?> webViewFactory = Class.forName("android.webkit.WebViewFactory");
+            java.lang.reflect.Method getProvider =
+                    webViewFactory.getDeclaredMethod("getProvider");
+
+            HookHandle handle = hook(getProvider).intercept(chain -> {
+                boolean shouldArm = false;
+                synchronized (chromiumAdapterLock) {
+                    shouldArm = chromiumAdapterState == ChromiumAdapterState.UNARMED;
+                }
+                if (shouldArm) {
+                    armChromiumDeferredLoaderObserver(
+                            cfg, "Android WebView provider initialization");
+                }
+
+                Object result = chain.proceed();
+
+                synchronized (chromiumAdapterLock) {
+                    cleanupWebViewTriggerLocked();
+                }
+                return result;
+            });
+
+            synchronized (chromiumAdapterLock) {
+                if (handle != null && chromiumAdapterState == ChromiumAdapterState.UNARMED) {
+                    chromiumWebViewTriggerHandle = handle;
+                    log(Log.INFO, TAG,
+                            "Chromium adapter UNARMED; WebView trigger installed");
+                } else if (handle != null) {
+                    try {
+                        handle.unhook();
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            log(Log.DEBUG, TAG, "WebView Chromium trigger unavailable: " + t);
+        }
+    }
+
+    /**
+     * Installs a bounded ClassLoader observer. It exists only in confirmed Chromium/WebView
+     * candidates and removes itself on success, failure, age limit, or class-load-count limit.
+     */
+    private void armChromiumDeferredLoaderObserver(FakeConfig cfg, String reason) {
+        synchronized (chromiumAdapterLock) {
+            if (chromiumAdapterState == ChromiumAdapterState.HOOKED
+                    || chromiumAdapterState == ChromiumAdapterState.ARMED) {
+                return;
+            }
+            if (chromiumAdapterState == ChromiumAdapterState.FAILED
+                    || chromiumAdapterState == ChromiumAdapterState.EXPIRED) {
+                log(Log.INFO, TAG,
+                        "Chromium adapter not re-armed after terminal state "
+                                + chromiumAdapterState);
+                return;
+            }
+            chromiumObserverStartedAtMs = SystemClock.elapsedRealtime();
+            chromiumObservedClassLoads = 0;
+            setChromiumAdapterStateLocked(ChromiumAdapterState.ARMED, reason);
+        }
+
+        final HookHandle[] handles = new HookHandle[2];
         try {
             java.lang.reflect.Method loadClassOne =
                     ClassLoader.class.getDeclaredMethod("loadClass", String.class);
             java.lang.reflect.Method loadClassTwo =
-                    ClassLoader.class.getDeclaredMethod("loadClass", String.class, boolean.class);
+                    ClassLoader.class.getDeclaredMethod(
+                            "loadClass", String.class, boolean.class);
 
             handles[0] = hook(loadClassOne).intercept(chain -> {
                 Object result = chain.proceed();
-                if (result instanceof Class<?> && target.equals(((Class<?>) result).getName())
-                        && installed.compareAndSet(false, true)) {
-                    installChromiumTimeZoneMonitorHook((Class<?>) result, cfg);
-                    unhookQuietly(handles);
-                    log(Log.INFO, TAG,
-                            "Chromium TimeZoneMonitor deferred hook installed from loadClass(String)");
-                }
+                onChromiumClassObserved(result, cfg, handles, "loadClass(String)");
                 return result;
             });
 
             handles[1] = hook(loadClassTwo).intercept(chain -> {
                 Object result = chain.proceed();
-                if (result instanceof Class<?> && target.equals(((Class<?>) result).getName())
-                        && installed.compareAndSet(false, true)) {
-                    installChromiumTimeZoneMonitorHook((Class<?>) result, cfg);
-                    unhookQuietly(handles);
-                    log(Log.INFO, TAG,
-                            "Chromium TimeZoneMonitor deferred hook installed from loadClass(String,boolean)");
-                }
+                onChromiumClassObserved(
+                        result, cfg, handles, "loadClass(String,boolean)");
                 return result;
             });
 
-            log(Log.INFO, TAG, "Chromium TimeZoneMonitor deferred loader observer armed");
+            synchronized (chromiumAdapterLock) {
+                if (chromiumAdapterState == ChromiumAdapterState.ARMED) {
+                    chromiumLoaderObserverHandles = handles;
+                    log(Log.INFO, TAG,
+                            "Chromium TimeZoneMonitor loader observer ARMED"
+                                    + " (maxLoads=" + CHROMIUM_LOADER_MAX_CLASS_LOADS
+                                    + ", maxAgeMs=" + CHROMIUM_LOADER_MAX_AGE_MS + ")");
+                } else {
+                    unhookQuietly(handles);
+                }
+            }
         } catch (Throwable t) {
             unhookQuietly(handles);
-            log(Log.WARN, TAG, "Chromium deferred loader observer failed: " + t);
+            synchronized (chromiumAdapterLock) {
+                setChromiumAdapterStateLocked(
+                        ChromiumAdapterState.FAILED,
+                        "loader observer installation failed: " + t);
+                cleanupChromiumLoaderObserverLocked();
+            }
         }
     }
 
-    private void installChromiumTimeZoneMonitorHook(Class<?> monitorClass, FakeConfig cfg)
-            throws NoSuchMethodException {
-        java.lang.reflect.Method getInstance =
-                monitorClass.getDeclaredMethod("getInstance", long.class);
+    private void onChromiumClassObserved(
+            Object result,
+            FakeConfig cfg,
+            HookHandle[] localHandles,
+            String source) {
+        if (!(result instanceof Class<?>)) return;
 
-        hookSafe(() -> hook(getInstance).intercept(chain -> {
+        Class<?> loadedClass = (Class<?>) result;
+        synchronized (chromiumAdapterLock) {
+            if (chromiumAdapterState != ChromiumAdapterState.ARMED) return;
+
+            chromiumObservedClassLoads++;
+            long ageMs = SystemClock.elapsedRealtime() - chromiumObserverStartedAtMs;
+
+            if (CHROMIUM_TIMEZONE_MONITOR.equals(loadedClass.getName())) {
+                HookHandle target = installChromiumTimeZoneMonitorHook(loadedClass, cfg);
+                if (target != null) {
+                    chromiumTargetHookHandle = target;
+                    setChromiumAdapterStateLocked(
+                            ChromiumAdapterState.HOOKED,
+                            "target loaded via " + source);
+                    cleanupChromiumLoaderObserverLocked();
+                    cleanupWebViewTriggerLocked();
+                } else {
+                    setChromiumAdapterStateLocked(
+                            ChromiumAdapterState.FAILED,
+                            "target class found but hook installation failed");
+                    cleanupChromiumLoaderObserverLocked();
+                    cleanupWebViewTriggerLocked();
+                }
+                return;
+            }
+
+            if (chromiumObservedClassLoads >= CHROMIUM_LOADER_MAX_CLASS_LOADS
+                    || ageMs >= CHROMIUM_LOADER_MAX_AGE_MS) {
+                setChromiumAdapterStateLocked(
+                        ChromiumAdapterState.EXPIRED,
+                        "observer bounds reached after "
+                                + chromiumObservedClassLoads + " class loads / "
+                                + ageMs + " ms");
+                cleanupChromiumLoaderObserverLocked();
+                cleanupWebViewTriggerLocked();
+            }
+        }
+    }
+
+    private void setChromiumAdapterStateLocked(
+            ChromiumAdapterState next, String reason) {
+        ChromiumAdapterState previous = chromiumAdapterState;
+        chromiumAdapterState = next;
+        if (previous != next) {
+            log(Log.INFO, TAG,
+                    "Chromium adapter " + previous + " -> " + next
+                            + " (" + reason + ")");
+        }
+    }
+
+    private void cleanupChromiumLoaderObserverLocked() {
+        HookHandle[] handles = chromiumLoaderObserverHandles;
+        chromiumLoaderObserverHandles = null;
+        if (handles != null) {
+            unhookQuietly(handles);
+        }
+    }
+
+    private void cleanupWebViewTriggerLocked() {
+        HookHandle handle = chromiumWebViewTriggerHandle;
+        chromiumWebViewTriggerHandle = null;
+        if (handle != null) {
+            try {
+                handle.unhook();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private HookHandle installChromiumTimeZoneMonitorHook(
+            Class<?> monitorClass, FakeConfig cfg) {
+        try {
+            java.lang.reflect.Method getInstance =
+                    monitorClass.getDeclaredMethod("getInstance", long.class);
+
+            HookHandle handle = hook(getInstance).intercept(chain -> {
             final long nativePtr = ((Number) chain.getArg(0)).longValue();
             Object instance = chain.proceed();
 
@@ -388,9 +610,22 @@ public class PrivacyMaskModule extends XposedModule {
                 log(Log.WARN, TAG,
                         "Chromium timezone injection exhausted all Java/JNI paths");
             }
-            return instance;
-        }));
-        log(Log.INFO, TAG, "Chromium TimeZoneMonitor target hook installed");
+                return instance;
+            });
+
+            if (handle != null) {
+                log(Log.INFO, TAG,
+                        "Chromium TimeZoneMonitor target hook installed");
+            } else {
+                log(Log.WARN, TAG,
+                        "Chromium TimeZoneMonitor hook returned no HookHandle");
+            }
+            return handle;
+        } catch (Throwable t) {
+            log(Log.WARN, TAG,
+                    "Chromium TimeZoneMonitor target hook installation failed: " + t);
+            return null;
+        }
     }
 
     private void logChromiumTimeZoneMonitorFieldLayout(Class<?> monitorClass) {
