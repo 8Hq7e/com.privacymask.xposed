@@ -5,8 +5,10 @@ import org.json.JSONObject;
 
 import java.time.DateTimeException;
 import java.time.ZoneId;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
@@ -248,13 +250,62 @@ public final class ConfigSnapshot {
                     "Longitude must be finite and between -180 and 180.");
         }
 
-        String warning = null;
+        // Phone number policy for schema v2: empty is allowed because Android may legitimately
+        // expose no line number. Non-empty values must use a basic E.164 representation so the
+        // same snapshot is not interpreted differently by different telephony call paths.
+        if (phoneNumber == null) {
+            return ValidationResult.error("Phone number cannot be null.");
+        }
+        if (!phoneNumber.isEmpty()
+                && !phoneNumber.matches("\\+[1-9]\\d{6,14}")) {
+            return ValidationResult.error(
+                    "Phone number must be empty or use E.164 form, e.g. +12135550147.");
+        }
+
+        List<String> warnings = new ArrayList<>();
         if (!locale.getCountry().isEmpty()
                 && !locale.getCountry().equalsIgnoreCase(isoCountry)) {
-            warning = "Locale region " + locale.getCountry()
-                    + " differs from identity country "
-                    + isoCountry.toUpperCase(Locale.US) + ".";
+            warnings.add(
+                    "Locale region " + locale.getCountry()
+                            + " differs from identity country "
+                            + isoCountry.toUpperCase(Locale.US) + ".");
         }
+
+        // Custom values are deliberately permitted. Built-in profiles are used only to surface
+        // contradictions that are easy to create accidentally; they do not block saving.
+        CountryProfile reference = findReferenceProfile(isoCountry);
+        if (reference != null) {
+            if (!reference.mcc.equals(mcc)) {
+                warnings.add(
+                        "MCC " + mcc + " differs from the built-in "
+                                + reference.displayName + " profile (" + reference.mcc + ").");
+            }
+            if (!reference.timezoneId.equals(timezoneId)) {
+                warnings.add(
+                        "Time zone " + timezoneId + " differs from the built-in "
+                                + reference.displayName + " profile ("
+                                + reference.timezoneId + ").");
+            }
+            if (!phoneNumber.isEmpty()
+                    && !phoneNumber.startsWith(reference.phonePrefix)) {
+                warnings.add(
+                        "Phone prefix does not match the built-in "
+                                + reference.displayName + " profile ("
+                                + reference.phonePrefix + ").");
+            }
+        }
+
+        String warning = warnings.isEmpty() ? null : String.join(" ", warnings);
         return ValidationResult.ok(warning);
+    }
+
+    private static CountryProfile findReferenceProfile(String isoCountry) {
+        if (isoCountry == null) return null;
+        for (CountryProfile profile : CountryProfile.all()) {
+            if (profile.isoCountry.equalsIgnoreCase(isoCountry)) {
+                return profile;
+            }
+        }
+        return null;
     }
 }
