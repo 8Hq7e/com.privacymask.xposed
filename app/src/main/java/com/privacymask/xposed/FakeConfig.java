@@ -2,20 +2,25 @@ package com.privacymask.xposed;
 
 import android.content.SharedPreferences;
 
+import org.json.JSONException;
+
 import java.util.HashMap;
+import java.util.Locale;
 import java.util.Map;
 
 import io.github.libxposed.api.XposedInterface;
 
 /**
- * Read-only snapshot of the current fake identity, taken from the remote preferences the
- * Xposed framework shares between PrivacyMask (writer, via XposedService) and every hooked
- * app's process (reader, via XposedInterface#getRemotePreferences — read-only there by
- * design). No ContentProvider, no IPC of our own to maintain: the framework already handles
- * getting this Bundle-free SharedPreferences view into the hooked process.
+ * Read-only process-local view of the authoritative PrivacyMask configuration.
  *
- * All fields fall back to a sensible built-in default if a key hasn't been written yet, so a
- * freshly installed module behaves consistently even before PrivacyMask has ever been opened.
+ * Hooked processes cannot write remote preferences, so this class understands all three startup
+ * states:
+ *  1) schema-v2 snapshot exists -> use it;
+ *  2) upgrade happened but UI has not migrated yet -> read legacy 1.2.x keys consistently;
+ *  3) completely fresh install -> use the same deterministic built-in default ConfigStore uses.
+ *
+ * Once the UI/service migrates or initializes schema v2, target processes read only that single
+ * serialized snapshot, eliminating mixed-version field reads.
  */
 public class FakeConfig {
 
@@ -28,31 +33,67 @@ public class FakeConfig {
     public final double latitude, longitude;
     public final int version;
 
-    // One flag per individual hook — see HookCatalog for the full grouped list of keys. All
-    // default to true, so a fresh install (or one upgrading from the old six group-level
-    // switches) behaves exactly like before this option existed.
     private final Map<String, Boolean> hookEnabled = new HashMap<>();
 
-    private FakeConfig(SharedPreferences sp) {
-        isoCountry = sp.getString(ConfigKeys.COUNTRY, "de");
-        mcc = sp.getString(ConfigKeys.MCC, "262");
-        mnc = sp.getString(ConfigKeys.MNC, "01");
-        simOperatorName = sp.getString(ConfigKeys.SIM_OP_NAME, "");
-        networkOperatorName = sp.getString(ConfigKeys.NET_OP_NAME, "");
-        timezoneId = sp.getString(ConfigKeys.TIMEZONE, "Europe/Berlin");
-        localeLang = sp.getString(ConfigKeys.LOCALE_LANG, "de");
-        localeCountry = sp.getString(ConfigKeys.LOCALE_COUNTRY, "DE");
-        phoneNumber = sp.getString(ConfigKeys.PHONE, "+491234567");
-        latitude = sp.getFloat(ConfigKeys.LAT, 52.5f);
-        longitude = sp.getFloat(ConfigKeys.LNG, 13.4f);
-        version = sp.getInt(ConfigKeys.VERSION, 0);
+    private FakeConfig(ConfigSnapshot snapshot) {
+        isoCountry = snapshot.isoCountry;
+        mcc = snapshot.mcc;
+        mnc = snapshot.mnc;
+        simOperatorName = snapshot.simOperatorName;
+        networkOperatorName = snapshot.networkOperatorName;
+        timezoneId = snapshot.timezoneId;
+        localeLang = snapshot.localeLanguage();
+        localeCountry = snapshot.localeCountry();
+        phoneNumber = snapshot.phoneNumber;
+        latitude = snapshot.latitude;
+        longitude = snapshot.longitude;
+        version = snapshot.configVersion;
 
         for (HookCatalog.Hook hook : HookCatalog.allHooks()) {
-            hookEnabled.put(hook.key, sp.getBoolean(hook.key, true));
+            hookEnabled.put(hook.key, snapshot.isHookEnabled(hook.key));
         }
     }
 
-    /** Whether the individual hook identified by one of the ConfigKeys.HOOK_* keys is on. */
+    private FakeConfig(SharedPreferences legacy) {
+        isoCountry = normalizeCountry(
+                legacy.getString(ConfigKeys.COUNTRY, "de"));
+        mcc = legacy.getString(ConfigKeys.MCC, "262");
+        mnc = legacy.getString(ConfigKeys.MNC, "01");
+        simOperatorName = legacy.getString(ConfigKeys.SIM_OP_NAME, "T-Mobile DE");
+        networkOperatorName =
+                legacy.getString(ConfigKeys.NET_OP_NAME, "T-Mobile DE");
+        timezoneId = legacy.getString(ConfigKeys.TIMEZONE, "Europe/Berlin");
+        localeLang = legacy.getString(ConfigKeys.LOCALE_LANG, "de");
+        localeCountry = legacy.getString(ConfigKeys.LOCALE_COUNTRY, "DE");
+        phoneNumber = legacy.getString(ConfigKeys.PHONE, "+491234567");
+        latitude = legacy.getFloat(ConfigKeys.LAT, 52.5f);
+        longitude = legacy.getFloat(ConfigKeys.LNG, 13.4f);
+        version = Math.max(1, legacy.getInt(ConfigKeys.VERSION, 0));
+
+        for (HookCatalog.Hook hook : HookCatalog.allHooks()) {
+            hookEnabled.put(hook.key, legacy.getBoolean(hook.key, true));
+        }
+    }
+
+    private FakeConfig() {
+        isoCountry = "de";
+        mcc = "262";
+        mnc = "01";
+        simOperatorName = "T-Mobile DE";
+        networkOperatorName = "T-Mobile DE";
+        timezoneId = "Europe/Berlin";
+        localeLang = "de";
+        localeCountry = "DE";
+        phoneNumber = "+491234567";
+        latitude = 52.5;
+        longitude = 13.4;
+        version = 1;
+
+        for (HookCatalog.Hook hook : HookCatalog.allHooks()) {
+            hookEnabled.put(hook.key, true);
+        }
+    }
+
     public boolean isHookEnabled(String key) {
         Boolean v = hookEnabled.get(key);
         return v == null || v;
@@ -62,16 +103,35 @@ public class FakeConfig {
         return mcc + mnc;
     }
 
-    /**
-     * Reads the current identity directly from the module's remote preferences.
-     * Safe to call from inside a hooked process with no Context and no round-trip through a
-     * ContentProvider — {@code xposed} is the module instance itself (XposedModule implements
-     * XposedInterface, which declares getRemotePreferences()).
-     *
-     * @throws UnsupportedOperationException if the running framework doesn't advertise
-     *                                        PROP_CAP_REMOTE (remote preferences support)
-     */
     static FakeConfig from(XposedInterface xposed) {
-        return new FakeConfig(xposed.getRemotePreferences(ConfigKeys.GROUP));
+        SharedPreferences sp =
+                xposed.getRemotePreferences(ConfigKeys.GROUP);
+
+        String json = sp.getString(ConfigKeys.SNAPSHOT_JSON, null);
+        if (json != null && !json.trim().isEmpty()) {
+            try {
+                ConfigSnapshot snapshot = ConfigSnapshot.fromJson(json);
+                ConfigSnapshot.ValidationResult validation = snapshot.validate();
+                if (validation.valid) {
+                    return new FakeConfig(snapshot);
+                }
+            } catch (JSONException | RuntimeException ignored) {
+                // Protective fallback below: a corrupt snapshot must not crash the target App.
+            }
+        }
+
+        // Upgrade compatibility before the UI performs the one-time schema-v2 migration.
+        if (sp.contains(ConfigKeys.COUNTRY)) {
+            return new FakeConfig(sp);
+        }
+
+        // Deterministic fresh-install default; opening PrivacyMask later will persist this exact
+        // identity instead of replacing it with a random one.
+        return new FakeConfig();
+    }
+
+    private static String normalizeCountry(String country) {
+        if (country == null) return "de";
+        return country.trim().toLowerCase(Locale.US);
     }
 }
