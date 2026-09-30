@@ -76,22 +76,7 @@ public class FakeConfig {
     }
 
     private FakeConfig() {
-        isoCountry = "de";
-        mcc = "262";
-        mnc = "01";
-        simOperatorName = "T-Mobile DE";
-        networkOperatorName = "T-Mobile DE";
-        timezoneId = "Europe/Berlin";
-        localeLang = "de";
-        localeCountry = "DE";
-        phoneNumber = "+491234567";
-        latitude = 52.5;
-        longitude = 13.4;
-        version = 1;
-
-        for (HookCatalog.Hook hook : HookCatalog.allHooks()) {
-            hookEnabled.put(hook.key, true);
-        }
+        this(ConfigStore.defaultSnapshot());
     }
 
     public boolean isHookEnabled(String key) {
@@ -116,16 +101,20 @@ public class FakeConfig {
                     return new FakeConfig(snapshot);
                 }
             } catch (JSONException | RuntimeException ignored) {
-                // Protective fallback below: a corrupt snapshot must not crash the target App.
+                // Fall through to the deterministic safe fake identity below. Once schema-v2
+                // exists, legacy keys are no longer authoritative and must never resurrect a
+                // stale identity after snapshot corruption.
             }
+            return new FakeConfig();
         }
 
-        // Upgrade compatibility before the UI performs the one-time schema-v2 migration.
+        // Upgrade compatibility only while schema-v2 is genuinely absent and before the UI
+        // performs the one-time migration.
         if (sp.contains(ConfigKeys.COUNTRY)) {
             return new FakeConfig(sp);
         }
 
-        // Deterministic fresh-install default; opening PrivacyMask later will persist this exact
+        // Deterministic fresh-install default; opening PrivacyMask later persists this exact
         // identity instead of replacing it with a random one.
         return new FakeConfig();
     }
