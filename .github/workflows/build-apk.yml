@@ -44,7 +44,7 @@ jobs:
 
       - name: Install Android SDK 37
         run: |
-          sdkmanager \
+          sdkmanager --channel=3 \
             "platform-tools" \
             "platforms;android-37" \
             "build-tools;37.0.0"
