@@ -2,6 +2,12 @@ plugins {
     id 'com.android.application'
 }
 
+def signingKeystorePath = System.getenv('SIGNING_KEYSTORE_PATH')
+def signingKeystorePassword = System.getenv('SIGNING_KEYSTORE_PASSWORD')
+def signingKeyAlias = System.getenv('SIGNING_KEY_ALIAS')
+def signingKeyPassword = System.getenv('SIGNING_KEY_PASSWORD')
+def hasReleaseSigning = signingKeystorePath && signingKeystorePassword && signingKeyAlias && signingKeyPassword
+
 android {
     namespace 'com.privacymask.xposed'
     compileSdk 37
@@ -14,9 +20,23 @@ android {
         versionName '1.1.0'
     }
 
+    signingConfigs {
+        release {
+            if (hasReleaseSigning) {
+                storeFile file(signingKeystorePath)
+                storePassword signingKeystorePassword
+                keyAlias signingKeyAlias
+                keyPassword signingKeyPassword
+            }
+        }
+    }
+
     buildTypes {
         release {
             minifyEnabled false
+            if (hasReleaseSigning) {
+                signingConfig signingConfigs.release
+            }
         }
     }
 
