@@ -214,7 +214,7 @@ public final class ConfigStore {
      * Deterministic fresh-install identity. This intentionally mirrors the old FakeConfig
      * fallback so upgrading behavior is predictable and a UI launch no longer changes identity.
      */
-    private static ConfigSnapshot defaultSnapshot() {
+    static ConfigSnapshot defaultSnapshot() {
         Map<String, Boolean> hooks = allHooksEnabled();
 
         return new ConfigSnapshot(
