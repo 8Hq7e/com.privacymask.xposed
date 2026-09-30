@@ -1,5 +1,7 @@
 package com.privacymask.xposed;
 
+import android.content.BroadcastReceiver;
+import android.content.Intent;
 import android.content.res.Configuration;
 import android.location.Location;
 import android.location.LocationManager;
@@ -239,10 +241,8 @@ public class PrivacyMaskModule extends XposedModule {
                         .intercept(chain -> fakeIcuTimeZone));
             }
 
-            // Chromium seeds its native/V8 timezone through this Java bridge on Android.
-            // Hook it when present; non-Chromium apps simply won't have the class and are
-            // unaffected. This is intentionally best-effort because Chromium package builds
-            // may move or remove the bridge across versions.
+            // Older Chromium builds seeded ICU through org.chromium.base.TimezoneUtils.
+            // Keep this best-effort hook for compatibility.
             if (appClassLoader != null) {
                 try {
                     Class<?> timezoneUtils =
@@ -253,9 +253,55 @@ public class PrivacyMaskModule extends XposedModule {
                             .intercept(chain -> cfg.timezoneId));
                     log(Log.INFO, TAG, "Chromium TimezoneUtils hook installed");
                 } catch (ClassNotFoundException | NoSuchMethodException ignored) {
-                    // Expected for non-Chromium apps and Chromium builds that use another path.
+                    // Expected on current Chromium builds.
                 } catch (Throwable t) {
-                    log(Log.WARN, TAG, "Chromium timezone hook unavailable: " + t);
+                    log(Log.WARN, TAG, "Chromium TimezoneUtils hook unavailable: " + t);
+                }
+
+                // Current Chromium propagates host timezone changes through
+                // org.chromium.device.time_zone_monitor.TimeZoneMonitor into native ICU,
+                // then notifies renderer processes, V8 and workers. After Chromium creates
+                // its monitor, inject one synthetic ACTION_TIMEZONE_CHANGED event directly
+                // into its own registered receiver. No protected broadcast is sent to the OS;
+                // we invoke the receiver instance in-process so Chromium follows its normal
+                // native update path with our configured IANA timezone.
+                try {
+                    Class<?> monitorClass = Class.forName(
+                            "org.chromium.device.time_zone_monitor.TimeZoneMonitor",
+                            false,
+                            appClassLoader);
+                    java.lang.reflect.Method getInstance =
+                            monitorClass.getDeclaredMethod("getInstance", long.class);
+                    hookSafe(() -> hook(getInstance).intercept(chain -> {
+                        Object instance = chain.proceed();
+                        try {
+                            java.lang.reflect.Field receiverField =
+                                    monitorClass.getDeclaredField("mBroadcastReceiver");
+                            receiverField.setAccessible(true);
+                            Object receiverObject = receiverField.get(instance);
+                            if (receiverObject instanceof BroadcastReceiver) {
+                                Intent fakeChange = new Intent(Intent.ACTION_TIMEZONE_CHANGED);
+                                fakeChange.putExtra(Intent.EXTRA_TIMEZONE, cfg.timezoneId);
+                                ((BroadcastReceiver) receiverObject).onReceive(null, fakeChange);
+                                log(Log.INFO, TAG,
+                                        "Chromium TimeZoneMonitor injected " + cfg.timezoneId);
+                            } else {
+                                log(Log.WARN, TAG,
+                                        "Chromium TimeZoneMonitor receiver field type changed");
+                            }
+                        } catch (Throwable t) {
+                            log(Log.WARN, TAG,
+                                    "Chromium TimeZoneMonitor injection failed: " + t);
+                        }
+                        return instance;
+                    }));
+                    log(Log.INFO, TAG, "Chromium TimeZoneMonitor hook installed");
+                } catch (ClassNotFoundException | NoSuchMethodException e) {
+                    log(Log.INFO, TAG,
+                            "Chromium TimeZoneMonitor class not present in this process");
+                } catch (Throwable t) {
+                    log(Log.WARN, TAG,
+                            "Chromium TimeZoneMonitor hook unavailable: " + t);
                 }
             }
         }
