@@ -254,6 +254,18 @@ public class PrivacyMaskModule extends XposedModule {
                     .intercept(chain -> fakeLocale));
             hookSafe(() -> hook(Locale.class.getDeclaredMethod("getDefault", Locale.Category.class))
                     .intercept(chain -> fakeLocale));
+
+            // Chromium and other modern Android apps may bypass Locale.getDefault() and read
+            // the process-wide LocaleList directly. Keep that list consistent with the same
+            // fake locale so navigator.languages and similar bridges do not expose secondary
+            // real device languages.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                final LocaleList fakeLocaleList = new LocaleList(fakeLocale);
+                hookSafe(() -> hook(LocaleList.class.getDeclaredMethod("getDefault"))
+                        .intercept(chain -> fakeLocaleList));
+                hookSafe(() -> hook(LocaleList.class.getDeclaredMethod("getAdjustedDefault"))
+                        .intercept(chain -> fakeLocaleList));
+            }
         }
 
         // getResources().getConfiguration().getLocales().get(0) never calls Locale.getDefault()
