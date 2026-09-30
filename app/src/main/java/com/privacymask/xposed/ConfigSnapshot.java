@@ -174,16 +174,20 @@ public final class ConfigSnapshot {
                             : hooks.optBoolean(hook.key, true));
         }
 
+        String rawLocaleTag = identity.getString("localeTag");
+        Locale parsedLocale = Locale.forLanguageTag(rawLocaleTag);
+        String canonicalLocaleTag = parsedLocale.toLanguageTag();
+
         return new ConfigSnapshot(
                 schemaVersion,
                 configVersion,
-                identity.getString("countryIso"),
+                identity.getString("countryIso").trim().toLowerCase(Locale.US),
                 identity.getString("mcc"),
                 identity.getString("mnc"),
                 identity.optString("simOperatorName", ""),
                 identity.optString("networkOperatorName", ""),
                 identity.getString("timezone"),
-                identity.getString("localeTag"),
+                canonicalLocaleTag,
                 identity.optString("phoneNumber", ""),
                 identity.getDouble("latitude"),
                 identity.getDouble("longitude"),
